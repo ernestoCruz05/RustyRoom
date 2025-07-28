@@ -15,16 +15,20 @@
 
 */
 
-use crate::resc::{User, Room, RoomState, Message, MessageType};
+use crate::resc::{User, Room, Account, RoomState, Message, MessageType};
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream, SocketAddr};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::io::{BufRead, BufReader, Write};
+use sha2::{Sha256, Digest};
+
 pub struct ChatServer { 
     users: HashMap<u16, User>,
     rooms: HashMap<u16, Room>,
     user_streams: HashMap<u16, TcpStream>,
+    accounts: HashMap<String, Account>,
+    unathenticated_users: HashMap<SocketAddr, TcpStream>,
     next_user_id: u16,
     next_room_id: u16,
 }
@@ -35,17 +39,68 @@ impl ChatServer{
             users: HashMap::new(),
             rooms: HashMap::new(),
             user_streams: HashMap::new(),
+            accounts: HashMap::new(),
+            unathenticated_users: HashMap::new(),
             next_user_id: 1,
             next_room_id: 1,
         }
     }
 
+    fn hash_password(password: &str) -> String {
+        let mut hasher = Sha256::new();
+        hasher.update(password);
+        format!("{:x}", hasher.finalize())
+    }
+
+    pub fn register_account(&mut self, username: String, password: String) -> Result<u16, String> {
+        if self.accounts.contains_key(&username) {
+            return Err("Username already exists".to_string());
+        }
+
+        let user_id = self.next_user_id;
+        let password_hash = Self::hash_password(&password);
+        let account = Account {
+            username: username.clone(),
+            hash: password_hash,
+            user_id,
+        };
+
+        self.accounts.insert(username, account);
+        self.next_user_id += 1;
+
+        Ok(user_id)
+    }        
+
+ pub fn login_acconut(&self, username: &str, password: &str) -> Result<u16, String> {
+    
+    if let Some(account) = self.accounts.get(username){
+        let password_hash = Self::hash_password(password);
+        if account.hash == password_hash {
+            Ok(account.user_id)
+        } else {
+            Err("Invalid password".to_string())
+        }
+    } else {
+        Err("Account does not exist".to_string())
+    }
+    
+ }
+
+    pub fn create_authenticated_user(&mut self, user_id: u16, username: String, address: SocketAddr, stream: TcpStream) {
+        let account = self.accounts.get(&username).unwrap();
+        let mut user = User::new(user_id, username, account.hash.clone(), address, false);
+        user.authed();
+        
+        self.users.insert(user_id, user);
+        self.user_streams.insert(user_id, stream);
+    }
+
 
         pub fn add_user(&mut self, username: String, address: SocketAddr) -> u16 {
         let user_id = self.next_user_id;
-        let user = User::new(user_id, username, address);
-        self.users.insert(user_id, user);
-        self.next_user_id += 1;
+        // let user = User::new(user_id, username, address);
+        //self.users.insert(user_id, user);
+        // self.next_user_id += 1;
         user_id
     }
 

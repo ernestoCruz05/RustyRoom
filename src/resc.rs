@@ -12,18 +12,26 @@ use serde::{Deserialize, Serialize};
 pub struct User{
     pub id: u16,
     pub username: String,
+    pub hash: String,
     pub address: SocketAddr,
     pub subscribed_rooms: Vec<Room>,
+    pub is_auth: bool,
 }
 
 impl User {
-    pub fn new(id: u16, username: String, address: SocketAddr) -> Self {
+    pub fn new(id: u16, username: String, hash: String,  address: SocketAddr,  is_auth: bool) -> Self {
         User {
             id,
             username,
+            hash,
             address,
             subscribed_rooms: Vec::new(),
+            is_auth: false,
         }
+    }
+
+    pub fn authed(&mut self) {
+        self.is_auth = true;
     }
 
     pub fn subscribe_room(&mut self, room: Room) {
@@ -66,11 +74,17 @@ impl Room {
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MessageType {
+    Register {username: String, password: String},
+    Login {username: String, password: String},
+    AuthSuccess {user_id: u16, message: String},
+    AuthFailure {reason: String},
     Join {room_id: u16},
     Leave {room_id: u16},
     RoomMessage {room_id: u16, content: String},
     PrivateMessage {to_user_id: u16, content: String},
     ServerResponse {success: bool, content: String},
+
+    
 }
 
 
@@ -96,4 +110,23 @@ impl Message {
         serde_json::from_str(json)
     }
 
+}
+
+// ? Account module down
+
+#[derive(Debug, Clone)]
+pub struct Account {
+    pub username: String,
+    pub hash: String,
+    pub user_id: u16,
+}
+
+impl Account{
+    pub fn new(username: String, hash: String, user_id: u16) -> Self {
+        Account{
+            username,
+            hash,
+            user_id,
+        }
+    }
 }
