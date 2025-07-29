@@ -26,7 +26,7 @@ impl User {
             hash,
             address,
             subscribed_rooms: Vec::new(),
-            is_auth: false,
+            is_auth,
         }
     }
 
@@ -45,11 +45,13 @@ impl User {
 
 // ? Room module down
 
+#[derive(Clone)]
 pub enum RoomState{
     Open,
     Closed,
 }
 
+#[derive(Clone)]
 pub struct Room{
     pub id: u16,
     pub name: String,

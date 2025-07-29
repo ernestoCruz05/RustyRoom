@@ -18,10 +18,12 @@ use std::io::{self, BufRead, BufReader, Write};
 use std::net::TcpStream;
 use std::thread;
 
+#[allow(dead_code)]
 pub struct ChatClient {
     server_address: String,
     user_id: u16,
     username: String,
+    authenticated: bool,
 }
 
 impl ChatClient {
@@ -30,6 +32,7 @@ impl ChatClient {
             server_address,
             user_id: 0, // Will be assigned by server
             username,
+            authenticated: false,
         }
     }
 
@@ -37,16 +40,13 @@ impl ChatClient {
         let stream = TcpStream::connect(&self.server_address)?;
         println!("Connected to server at {}", self.server_address);
         
-        // Clone stream for reading
         let read_stream = stream.try_clone()?;
         let mut write_stream = stream;
 
-        // Start message receiver thread
         thread::spawn(move || {
             Self::message_receiver(read_stream);
         });
 
-        // Handle user input in main thread
         self.handle_user_input(&mut write_stream)?;
 
         Ok(())
@@ -71,11 +71,18 @@ impl ChatClient {
 
     fn display_message(message: Message) {
         match message.message_type {
+            MessageType::AuthSuccess { user_id, message: msg } => {
+                println!("[SUCCESS] {}", msg);
+                println!("Your user ID is: {}", user_id);
+            }
+            MessageType::AuthFailure { reason } => {
+                println!("[ERROR] {}", reason);
+            }
             MessageType::RoomMessage { room_id, content } => {
                 println!("[Room {}] User {}: {}", room_id, message.sender_id, content);
             }
             MessageType::PrivateMessage { to_user_id: _, content } => {
-                println!("[Private] User {}: {}", message.sender_id, content);
+                println!("[Private from User {}]: {}", message.sender_id, content);
             }
             MessageType::ServerResponse { success, content } => {
                 if success {
@@ -84,14 +91,24 @@ impl ChatClient {
                     println!("[Server Error]: {}", content);
                 }
             }
-            _ => {
-                println!("[Unknown message type]");
+            MessageType::Register { .. } | MessageType::Login { .. } => {
+                // These shouldn't be received by client, but handle gracefully
+                println!("[Debug] Received unexpected auth message");
+            }
+            MessageType::Join { .. } | MessageType::Leave { .. } => {
+                // These shouldn't be received by client, but handle gracefully
+                println!("[Debug] Received unexpected room action message");
             }
         }
     }
 
     fn handle_user_input(&mut self, stream: &mut TcpStream) -> io::Result<()> {
-        println!("Commands:");
+        println!("Welcome to FCA Chat!");
+        println!("Authentication Commands:");
+        println!("  /register <username> <password> - Create new account");
+        println!("  /login <username> <password> - Login to existing account");
+        println!();
+        println!("Chat Commands (after authentication):");
         println!("  /join <room_id> - Join a room");
         println!("  /leave <room_id> - Leave a room"); 
         println!("  /msg <room_id> <message> - Send message to room");
@@ -120,20 +137,54 @@ impl ChatClient {
         let parts: Vec<&str> = input.split_whitespace().collect();
         
         match parts.get(0)? {
-        &"/join" => {
+            &"/register" => {
+                if parts.len() < 3 {
+                    println!("Usage: /register <username> <password>");
+                    return None;
+                }
+                let username = parts[1].to_string();
+                let password = parts[2].to_string();
+                Some(Message::new(0, MessageType::Register { username, password }))
+            }
+            &"/login" => {
+                if parts.len() < 3 {
+                    println!("Usage: /login <username> <password>");
+                    return None;
+                }
+                let username = parts[1].to_string();
+                let password = parts[2].to_string();
+                Some(Message::new(0, MessageType::Login { username, password }))
+            }
+            &"/join" => {
+                if parts.len() < 2 {
+                    println!("Usage: /join <room_id>");
+                    return None;
+                }
                 let room_id: u16 = parts.get(1)?.parse().ok()?;
                 Some(Message::new(self.user_id, MessageType::Join { room_id }))
             }
             &"/leave" => {
+                if parts.len() < 2 {
+                    println!("Usage: /leave <room_id>");
+                    return None;
+                }
                 let room_id: u16 = parts.get(1)?.parse().ok()?;
                 Some(Message::new(self.user_id, MessageType::Leave { room_id }))
             }
             &"/msg" => {
+                if parts.len() < 3 {
+                    println!("Usage: /msg <room_id> <message>");
+                    return None;
+                }
                 let room_id: u16 = parts.get(1)?.parse().ok()?;
                 let content = parts[2..].join(" ");
                 Some(Message::new(self.user_id, MessageType::RoomMessage { room_id, content }))
             }
             &"/private" => {
+                if parts.len() < 3 {
+                    println!("Usage: /private <user_id> <message>");
+                    return None;
+                }
                 let to_user_id: u16 = parts.get(1)?.parse().ok()?;
                 let content = parts[2..].join(" ");
                 Some(Message::new(self.user_id, MessageType::PrivateMessage { to_user_id, content }))
@@ -144,6 +195,7 @@ impl ChatClient {
             }
         }
     }
+
 
     pub fn start_client(server_address: &str, username: &str) -> io::Result<()> {
         let mut client = ChatClient::new(server_address.to_string(), username.to_string());
