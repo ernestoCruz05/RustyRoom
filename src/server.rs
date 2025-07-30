@@ -15,6 +15,8 @@
 
 */
 
+#![allow(dead_code)]
+
 use crate::resc::{User, Room, Account, RoomState, Message, MessageType};
 use std::collections::HashMap;
 use std::net::{TcpListener, TcpStream, SocketAddr};
@@ -132,7 +134,6 @@ impl ChatServer{
         let client_address = stream.peer_addr().unwrap();
         println!("Connection: [{}]", client_address);
 
-        // Store the stream for unauthenticated connections
         {
             let mut server_lock = server.lock().unwrap();
             server_lock.unauthenticated_connections.insert(client_address, stream.try_clone().unwrap());
@@ -152,7 +153,6 @@ impl ChatServer{
             }
         }
         
-        // Clean up connections when client disconnects
         {
             let mut server_lock = server.lock().unwrap();
             server_lock.unauthenticated_connections.remove(&client_address);
@@ -177,11 +177,16 @@ impl ChatServer{
             MessageType::Register { username, password } => {
                 match server_lock.register_account(username.clone(), password) {
                     Ok(user_id) => {
+                        // Auto-login the user after successful registration
+                        if let Some(stream) = server_lock.unauthenticated_connections.remove(&client_addr) {
+                            server_lock.create_authenticated_user(user_id, username.clone(), client_addr, stream);
+                        }
+                        
                         let response = Message::new(0, MessageType::AuthSuccess { 
                             user_id, 
                             message: format!("Registration successful! Welcome, {}", username) 
                         });
-                        Self::send_to_address(&server_lock, client_addr, response);
+                        Self::send_to_user(&server_lock, user_id, response);
                     }
                     Err(error) => {
                         let response = Message::new(0, MessageType::AuthFailure { reason: error });
@@ -211,28 +216,84 @@ impl ChatServer{
             _ => {
                 if let Some(user) = server_lock.users.values().find(|u| u.address == client_addr && u.is_auth) {
                     let user_id = user.id;
-                    // Handle other message types...
                     match message.message_type {
-                        MessageType::Join { room_id } => {
-                            // Create room if it doesn't exist
+                        MessageType::Join { room_id, password } => {
                             if !server_lock.rooms.contains_key(&room_id) {
-                                let room = Room::new(room_id, format!("Room {}", room_id), RoomState::Open);
-                                server_lock.rooms.insert(room_id, room);
-                            }
-                            
-                            // Get room clone first to avoid borrow issues
-                            let room_clone = server_lock.rooms.get(&room_id).cloned();
-                            
-                            // Add user to room
-                            if let Some(user) = server_lock.users.get_mut(&user_id) {
-                                if let Some(room) = room_clone {
-                                    user.subscribe_room(room);
+                                // Room doesn't exist, ask user to create it
+                                let response = Message::new(0, MessageType::RoomNotFound { room_id });
+                                Self::send_to_user(&server_lock, user_id, response);
+                            } else {
+                                let room = server_lock.rooms.get(&room_id).cloned().unwrap();
+                                
+                                // Check password if room is password protected
+                                let can_join = if room.is_password_protected() {
+                                    match password {
+                                        Some(pass) => {
+                                            let password_hash = Self::hash_password(&pass);
+                                            room.verify_password(&password_hash)
+                                        }
+                                        None => false,
+                                    }
+                                } else {
+                                    true
+                                };
+                                
+                                if can_join {
+                                    if let Some(user) = server_lock.users.get_mut(&user_id) {
+                                        user.subscribe_room(room.clone());
+                                        let response = Message::new(0, MessageType::RoomJoined { 
+                                            room_id: room.id,
+                                            name: room.name.clone(),
+                                            description: room.description.clone(),
+                                        });
+                                        Self::send_to_user(&server_lock, user_id, response);
+                                    }
+                                } else {
                                     let response = Message::new(0, MessageType::ServerResponse { 
-                                        success: true, 
-                                        content: format!("Joined room {}", room_id) 
+                                        success: false, 
+                                        content: "Invalid room password".to_string() 
                                     });
                                     Self::send_to_user(&server_lock, user_id, response);
                                 }
+                            }
+                        }
+                        MessageType::CreateRoom { room_id, name, description, password } => {
+                            if server_lock.rooms.contains_key(&room_id) {
+                                let response = Message::new(0, MessageType::ServerResponse { 
+                                    success: false, 
+                                    content: format!("Room {} already exists", room_id) 
+                                });
+                                Self::send_to_user(&server_lock, user_id, response);
+                            } else {
+                                let room = if let Some(pass) = password {
+                                    let password_hash = Self::hash_password(&pass);
+                                    Room::new_with_password(room_id, name.clone(), description.clone(), password_hash)
+                                } else {
+                                    Room::new(room_id, name.clone(), description.clone(), RoomState::Open)
+                                };
+                                
+                                server_lock.rooms.insert(room_id, room.clone());
+                                server_lock.next_room_id = server_lock.next_room_id.max(room_id + 1);
+                                
+                                // Automatically join the user to the room they created
+                                if let Some(user) = server_lock.users.get_mut(&user_id) {
+                                    user.subscribe_room(room.clone());
+                                }
+                                
+                                let response = Message::new(0, MessageType::RoomCreated { 
+                                    room_id,
+                                    name: name.clone(),
+                                    description: description.clone(),
+                                });
+                                Self::send_to_user(&server_lock, user_id, response);
+                                
+                                // Send join confirmation
+                                let join_response = Message::new(0, MessageType::RoomJoined { 
+                                    room_id,
+                                    name,
+                                    description,
+                                });
+                                Self::send_to_user(&server_lock, user_id, join_response);
                             }
                         }
                         MessageType::Leave { room_id } => {
@@ -245,23 +306,29 @@ impl ChatServer{
                                 Self::send_to_user(&server_lock, user_id, response);
                             }
                         }
-                        MessageType::RoomMessage { room_id, content } => {
-                            // Broadcast message to all users in the room
+                        MessageType::RoomMessage { room_id, sender_username: _, content } => {
                             let users_in_room: Vec<u16> = server_lock.users.values()
                                 .filter(|u| u.subscribed_rooms.iter().any(|r| r.id == room_id))
                                 .map(|u| u.id)
                                 .collect();
                             
-                            let broadcast_message = Message::new(user_id, MessageType::RoomMessage { room_id, content });
+                            let sender_username = server_lock.users.get(&user_id)
+                                .map(|u| u.username.clone())
+                                .unwrap_or_else(|| format!("User {}", user_id));
+                            let broadcast_message = Message::new(user_id, MessageType::RoomMessage { room_id, sender_username, content });
                             
                             for target_user_id in users_in_room {
                                 Self::send_to_user(&server_lock, target_user_id, broadcast_message.clone());
                             }
                         }
-                        MessageType::PrivateMessage { to_user_id, content } => {
-                            // Send private message to specific user
+                        MessageType::PrivateMessage { to_user_id, sender_username: _, content } => {
                             if server_lock.users.contains_key(&to_user_id) {
-                                let private_message = Message::new(user_id, MessageType::PrivateMessage { to_user_id, content });
+
+                                let sender_username = server_lock.users.get(&user_id)
+                                    .map(|u| u.username.clone())
+                                    .unwrap_or_else(|| format!("User {}", user_id));
+
+                                let private_message = Message::new(user_id, MessageType::PrivateMessage { to_user_id, sender_username, content });
                                 Self::send_to_user(&server_lock, to_user_id, private_message);
                             } else {
                                 let response = Message::new(0, MessageType::ServerResponse { 
