@@ -2,6 +2,8 @@
  Oh yeah yeah, shared resources module! yeah yeah
 */
 
+#![allow(dead_code)]
+
 use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
 
@@ -48,6 +50,7 @@ impl User {
 #[derive(Clone)]
 pub enum RoomState{
     Open,
+    Private,
     Closed,
 }
 
@@ -55,20 +58,45 @@ pub enum RoomState{
 pub struct Room{
     pub id: u16,
     pub name: String,
-    pub state: RoomState, 
+    pub description: String,
+    pub state: RoomState,
+    pub password_hash: Option<String>, // SHA-256 hash if password protected
 }
 
 impl Room {
-    pub fn new(id: u16, name: String, state: RoomState) -> Self {
+    pub fn new(id: u16, name: String, description: String, state: RoomState) -> Self {
         Room {
             id,
             name,
+            description,
             state,
+            password_hash: None,
+        }
+    }
+
+    pub fn new_with_password(id: u16, name: String, description: String, password_hash: String) -> Self {
+        Room {
+            id,
+            name,
+            description,
+            state: RoomState::Private,
+            password_hash: Some(password_hash),
         }
     }
 
     pub fn set_state(&mut self, state: RoomState) {
         self.state = state;
+    }
+
+    pub fn is_password_protected(&self) -> bool {
+        self.password_hash.is_some()
+    }
+
+    pub fn verify_password(&self, password_hash: &str) -> bool {
+        match &self.password_hash {
+            Some(hash) => hash == password_hash,
+            None => true, // No password required
+        }
     }
 }
 
@@ -80,13 +108,15 @@ pub enum MessageType {
     Login {username: String, password: String},
     AuthSuccess {user_id: u16, message: String},
     AuthFailure {reason: String},
-    Join {room_id: u16},
+    Join {room_id: u16, password: Option<String>},
     Leave {room_id: u16},
-    RoomMessage {room_id: u16, content: String},
-    PrivateMessage {to_user_id: u16, content: String},
+    CreateRoom {room_id: u16, name: String, description: String, password: Option<String>},
+    RoomCreated {room_id: u16, name: String, description: String},
+    RoomJoined {room_id: u16, name: String, description: String},
+    RoomNotFound {room_id: u16},
+    RoomMessage {room_id: u16, sender_username: String, content: String},
+    PrivateMessage {to_user_id: u16, sender_username: String, content: String},
     ServerResponse {success: bool, content: String},
-
-    
 }
 
 
