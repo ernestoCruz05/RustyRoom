@@ -4,16 +4,22 @@ A multi-threaded TCP chat server written in Rust that allows multiple clients to
 
 ## Features
 
-!! Some of these features are yet to be implemented/polished
-!! Only works on the local network, more support later maybe 
+✅ **Completed Features:**
+- 🖥️  **Modern TUI Interface** - Beautiful terminal user interface with ratatui
+- 👥  **Multi-client Support** - Multiple clients can connect simultaneously  
+- 🏠  **Room-based Chat** - Clients can join different chat rooms with descriptions
+- 🔐  **User Authentication** - Secure registration and login system
+- 🔒  **Private Rooms** - Password-protected rooms for secure discussions
+- 💬  **Private Messaging** - Direct messages between users
+- 🎨  **Rich UI** - Room tabs, message history, real-time updates
+- ⚡  **Real-time** - Instant message delivery and updates
+- 🛡️  **Graceful Handling** - Proper client disconnection management
 
--  Multiple clients can connect simultaneously
--  Clients can join different chat rooms
--  Messages are broadcasted to all clients in the same room
--  Private messaging between users
--  Graceful client disconnection handling
--  Admin client for room and user management
--  Room state management (Open/Closed)
+🚧 **In Progress:**
+- 🔧  **Admin Commands** - Room and user management
+- 📚  **Message History** - Persistent chat history
+- 🌐  **WebSocket Support** - Modern web connectivity
+- 🖱️  **GUI Client** - Cross-platform desktop application
 
 ## Architecture
 
@@ -42,22 +48,54 @@ cargo build --release
 ### Running the Server
 
 ```bash
-cargo run
+cargo run -- server
 ```
 
 ### Running a Client
 
+#### TUI Client (Recommended)
 ```bash
-# In another terminal
-cargo run client YourUsername
+cargo run -- tui
+```
+
+#### CLI Client
+```bash
+cargo run -- client YourUsername
 ```
 
 ## Usage
 
-### Client Commands
+### TUI Client Commands
 
-- `/join <room_id>` - Join a room
+**Authentication Screen:**
+- `Tab` - Switch between username/password fields
+- `F2` - Toggle between Login/Register mode
+- `Enter` - Submit authentication
+- `Esc` - Quit application
+
+**Main Chat Interface:**
+- `Enter` - Send message or command
+- `Tab` - Switch between joined rooms
+- `F1` - Show help dialog
+- `F2` - Room browser (create/join rooms)
+- `F3` - Private message interface
+- `F4` - Settings
+- `Esc` - Close dialogs or quit
+
+**Chat Commands:**
+- `/join <room_id> [password]` - Join a room
+- `/create <room_id> <name> <description> [password]` - Create new room
 - `/leave <room_id>` - Leave a room
+
+### CLI Client Commands
+
+### CLI Client Commands
+
+- `/register <username> <password>` - Create new account
+- `/login <username> <password>` - Login to existing account
+- `/join <room_id> [password]` - Join a room
+- `/leave <room_id>` - Leave a room
+- `/create <room_id> <name> <description> [password]` - Create new room
 - `/msg <room_id> <message>` - Send message to room
 - `/private <user_id> <message>` - Send private message
 - `/quit` - Disconnect from server
@@ -66,27 +104,25 @@ cargo run client YourUsername
 
 ```bash
 # Terminal 1 - Start server
-$ cargo run
+$ cargo run -- server
 Starting TCP Chat Server...
 Server listening to [127.0.0.1:8080]
 
-# Terminal 2 - Client 1
-$ cargo run client Alice
-Starting TCP Chat Client as 'Alice'...
-Connected to server at 127.0.0.1:8080
-Commands:
-  /join <room_id> - Join a room
-  /leave <room_id> - Leave a room
-  /msg <room_id> <message> - Send message to room
-  /private <user_id> <message> - Send private message
-  /quit - Disconnect
-/join 1
-/msg 1 Hello everyone!
+# Terminal 2 - TUI Client
+$ cargo run -- tui
+# Beautiful TUI interface opens
+# 1. Enter username/password in auth screen
+# 2. Use Tab to switch fields, F2 to toggle Login/Register
+# 3. Press Enter to authenticate
+# 4. Use /create 1 "General" "General discussion"
+# 5. Type messages normally, use Tab to switch rooms
 
-# Terminal 3 - Client 2
-$ cargo run client Bob
-/join 1
-[Room 1] User 1: Hello everyone!
+# Terminal 3 - CLI Client (alternative)
+$ cargo run -- client Alice
+/register alice password123
+[SUCCESS] Registration successful! Welcome, alice
+/create 1 "General" "General discussion"
+/msg 1 Hello from CLI!
 ```
 
 ## Development
@@ -137,8 +173,10 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 
 ## Roadmap
 
-- [ ] Implement room creation/deletion
-- [ ] Add user authentication
+- [X] Implement room creation/deletion
+- [X] Add user authentication
+- [x] Add password-protected private rooms
+- [x] Implement descriptive room system
 - [ ] Implement admin commands
 - [ ] Add message history
 - [ ] WebSocket support
