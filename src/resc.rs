@@ -60,7 +60,7 @@ pub struct Room{
     pub name: String,
     pub description: String,
     pub state: RoomState,
-    pub password_hash: Option<String>, // SHA-256 hash if password protected
+    pub password_hash: Option<String>, 
 }
 
 impl Room {
@@ -95,7 +95,7 @@ impl Room {
     pub fn verify_password(&self, password_hash: &str) -> bool {
         match &self.password_hash {
             Some(hash) => hash == password_hash,
-            None => true, // No password required
+            None => true, 
         }
     }
 }

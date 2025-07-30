@@ -5,21 +5,20 @@ A multi-threaded TCP chat server written in Rust that allows multiple clients to
 ## Features
 
 ✅ **Completed Features:**
-- 🖥️  **Modern TUI Interface** - Beautiful terminal user interface with ratatui
-- 👥  **Multi-client Support** - Multiple clients can connect simultaneously  
-- 🏠  **Room-based Chat** - Clients can join different chat rooms with descriptions
-- 🔐  **User Authentication** - Secure registration and login system
-- 🔒  **Private Rooms** - Password-protected rooms for secure discussions
-- 💬  **Private Messaging** - Direct messages between users
-- 🎨  **Rich UI** - Room tabs, message history, real-time updates
-- ⚡  **Real-time** - Instant message delivery and updates
-- 🛡️  **Graceful Handling** - Proper client disconnection management
+-   **Modern TUI Interface** - Beautiful terminal user interface with ratatui
+-   **Multi-client Support** - Multiple clients can connect simultaneously  
+-   **Room-based Chat** - Clients can join different chat rooms with descriptions
+-   **User Authentication** - Secure registration and login system
+-   **Private Rooms** - Password-protected rooms for secure discussions
+-   **Private Messaging** - Direct messages between users
+-   **Rich UI** - Room tabs, message history, real-time updates
+-   **Real-time** - Instant message delivery and updates
+-   **Graceful Handling** - Proper client disconnection management
 
 🚧 **In Progress:**
-- 🔧  **Admin Commands** - Room and user management
-- 📚  **Message History** - Persistent chat history
-- 🌐  **WebSocket Support** - Modern web connectivity
-- 🖱️  **GUI Client** - Cross-platform desktop application
+-   **Admin Commands** - Room and user management
+-   **Message History** - Persistent chat history
+-   **WebSocket Support** - Modern web connectivity
 
 ## Architecture
 
@@ -110,7 +109,6 @@ Server listening to [127.0.0.1:8080]
 
 # Terminal 2 - TUI Client
 $ cargo run -- tui
-# Beautiful TUI interface opens
 # 1. Enter username/password in auth screen
 # 2. Use Tab to switch fields, F2 to toggle Login/Register
 # 3. Press Enter to authenticate
@@ -132,12 +130,13 @@ $ cargo run -- client Alice
 ```
 fca/
 ├── src/
-│   ├── main.rs      # Entry point
-│   ├── server.rs    # TCP server implementation
-│   ├── client.rs    # TCP client implementation
-│   └── resc.rs      # Shared resources and data structures
-├── Cargo.toml       # Dependencies
-└── README.md        # This file
+│   ├── main.rs        # Entry point
+│   ├── server.rs      # TCP server implementation
+│   ├── client.rs      # TCP client implementation
+│   └── resc.rs        # Shared resources and data structures
+|   └── tui_client.rs  # Text User Interface 
+├── Cargo.toml         # Dependencies
+└── README.md          # This file
 ```
 
 ### Building
@@ -164,6 +163,7 @@ pub enum MessageType {
     RoomMessage { room_id: u16, content: String },
     PrivateMessage { to_user_id: u16, content: String },
     ServerResponse { success: bool, content: String },
+    // more fields...
 }
 ```
 
@@ -180,4 +180,3 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [ ] Implement admin commands
 - [ ] Add message history
 - [ ] WebSocket support
-- [ ] GUI client

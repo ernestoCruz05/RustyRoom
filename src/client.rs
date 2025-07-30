@@ -34,7 +34,7 @@ impl ChatClient {
     pub fn new(server_address: String, username: String) -> Self {
         ChatClient {
             server_address,
-            user_id: 0, // Will be assigned by server
+            user_id: 0, 
             username,
             authenticated: false,
         }
@@ -47,7 +47,6 @@ impl ChatClient {
         let read_stream = stream.try_clone()?;
         let mut write_stream = stream;
 
-        // Create a shared client for the message receiver thread
         let client_clone = Arc::new(Mutex::new(self.clone()));
         let client_for_receiver = Arc::clone(&client_clone);
 
@@ -55,7 +54,6 @@ impl ChatClient {
             Self::message_receiver(read_stream, client_for_receiver);
         });
 
-        // Show initial authentication commands only
         Self::show_auth_commands();
 
         self.handle_user_input(&mut write_stream, client_clone)?;
@@ -69,17 +67,13 @@ impl ChatClient {
             match line {
                 Ok(json_message) => {
                     if let Ok(message) = Message::from_json_file(&json_message) {
-                        // Check if this is an authentication success message
                         if let MessageType::AuthSuccess { user_id, .. } = &message.message_type {
-                            // Update client state
                             {
                                 let mut client_lock = client.lock().unwrap();
                                 client_lock.authenticated = true;
                                 client_lock.user_id = *user_id;
                             }
-                            // Show the success message first
                             Self::display_message(message);
-                            // Then show chat commands after successful auth
                             Self::show_chat_commands();
                         } else {
                             Self::display_message(message);
@@ -137,11 +131,9 @@ impl ChatClient {
                 println!("       Example: /create {} \"General Chat\" \"A place for general discussion\"", room_id);
             }
             MessageType::Register { .. } | MessageType::Login { .. } => {
-                // These shouldn't be received by client, but handle gracefully
                 println!("[Debug] Received unexpected auth message");
             }
             MessageType::Join { .. } | MessageType::Leave { .. } | MessageType::CreateRoom { .. } => {
-                // These shouldn't be received by client, but handle gracefully
                 println!("[Debug] Received unexpected room action message");
             }
         }
@@ -156,7 +148,6 @@ impl ChatClient {
                 break;
             }
             
-            // Get current authentication state
             let is_authenticated = {
                 let client_lock = client_clone.lock().unwrap();
                 client_lock.authenticated
@@ -173,7 +164,6 @@ impl ChatClient {
     }
 
     fn parse_command(&self, input: &str, is_authenticated: bool) -> Option<Message> {
-        // First split to get the command
         let parts: Vec<&str> = input.split_whitespace().collect();
         
         match parts.get(0)? {
@@ -238,7 +228,6 @@ impl ChatClient {
                     return None;
                 }
                 
-                // Parse /create command with proper quote handling
                 let args = Self::parse_quoted_args(input)?;
                 if args.len() < 4 {
                     println!("Usage: /create <room_id> <name> <description> [password]");
@@ -294,7 +283,6 @@ impl ChatClient {
         }
     }
 
-    // Helper function to parse command arguments with proper quote handling
     fn parse_quoted_args(input: &str) -> Option<Vec<String>> {
         let mut args = Vec::new();
         let mut current_arg = String::new();
@@ -318,7 +306,6 @@ impl ChatClient {
             }
         }
         
-        // Add the last argument if any
         if !current_arg.is_empty() {
             args.push(current_arg.trim().to_string());
         }

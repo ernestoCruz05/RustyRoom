@@ -30,7 +30,7 @@ pub struct ChatServer {
     rooms: HashMap<u16, Room>,
     user_streams: HashMap<u16, TcpStream>,
     accounts: HashMap<String, Account>,
-    unauthenticated_connections: HashMap<SocketAddr, TcpStream>, // Fixed name
+    unauthenticated_connections: HashMap<SocketAddr, TcpStream>, 
     next_user_id: u16,
     next_room_id: u16,
 }
@@ -42,7 +42,7 @@ impl ChatServer{
             rooms: HashMap::new(),
             user_streams: HashMap::new(),
             accounts: HashMap::new(),
-            unauthenticated_connections: HashMap::new(), // Fixed name
+            unauthenticated_connections: HashMap::new(), 
             next_user_id: 1,
             next_room_id: 1,
         }
@@ -157,7 +157,6 @@ impl ChatServer{
             let mut server_lock = server.lock().unwrap();
             server_lock.unauthenticated_connections.remove(&client_address);
             
-            // Also remove from authenticated users if they were logged in
             let user_to_remove: Option<u16> = server_lock.users.values()
                 .find(|u| u.address == client_address)
                 .map(|u| u.id);
@@ -177,7 +176,6 @@ impl ChatServer{
             MessageType::Register { username, password } => {
                 match server_lock.register_account(username.clone(), password) {
                     Ok(user_id) => {
-                        // Auto-login the user after successful registration
                         if let Some(stream) = server_lock.unauthenticated_connections.remove(&client_addr) {
                             server_lock.create_authenticated_user(user_id, username.clone(), client_addr, stream);
                         }
@@ -219,13 +217,11 @@ impl ChatServer{
                     match message.message_type {
                         MessageType::Join { room_id, password } => {
                             if !server_lock.rooms.contains_key(&room_id) {
-                                // Room doesn't exist, ask user to create it
                                 let response = Message::new(0, MessageType::RoomNotFound { room_id });
                                 Self::send_to_user(&server_lock, user_id, response);
                             } else {
                                 let room = server_lock.rooms.get(&room_id).cloned().unwrap();
                                 
-                                // Check password if room is password protected
                                 let can_join = if room.is_password_protected() {
                                     match password {
                                         Some(pass) => {
@@ -275,7 +271,6 @@ impl ChatServer{
                                 server_lock.rooms.insert(room_id, room.clone());
                                 server_lock.next_room_id = server_lock.next_room_id.max(room_id + 1);
                                 
-                                // Automatically join the user to the room they created
                                 if let Some(user) = server_lock.users.get_mut(&user_id) {
                                     user.subscribe_room(room.clone());
                                 }
@@ -287,7 +282,6 @@ impl ChatServer{
                                 });
                                 Self::send_to_user(&server_lock, user_id, response);
                                 
-                                // Send join confirmation
                                 let join_response = Message::new(0, MessageType::RoomJoined { 
                                     room_id,
                                     name,

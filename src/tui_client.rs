@@ -56,34 +56,28 @@ pub struct Room {
 
 #[derive(Debug)]
 pub struct TuiChatClient {
-    // Connection state
     server_address: String,
     
-    // Authentication
     authenticated: bool,
     user_id: u16,
     username: String,
     
-    // UI state
     input: String,
     current_room: Option<u16>,
     rooms: HashMap<u16, Room>,
     joined_rooms: Vec<u16>,
     
-    // UI control
     show_help: bool,
     show_room_browser: bool,
     show_settings: bool,
     cursor_position: usize,
     
-    // Authentication screen state
     auth_mode: AuthMode,
     auth_username: String,
     auth_password: String,
     auth_field: AuthField,
     auth_error: Option<String>,
     
-    // Channels for async communication
     message_sender: Option<mpsc::UnboundedSender<Message>>,
     auth_receiver: Option<mpsc::UnboundedReceiver<bool>>,
 }
@@ -126,7 +120,6 @@ impl TuiChatClient {
     }
 
     pub async fn start_tui(server_address: &str) -> io::Result<()> {
-        // Setup terminal
         enable_raw_mode()?;
         let mut stdout = io::stdout();
         execute!(stdout, EnterAlternateScreen, EnableMouseCapture)?;
@@ -136,7 +129,6 @@ impl TuiChatClient {
         let mut app = TuiChatClient::new(server_address.to_string());
         let result = app.run(&mut terminal).await;
 
-        // Restore terminal
         disable_raw_mode()?;
         execute!(
             terminal.backend_mut(),
@@ -149,21 +141,18 @@ impl TuiChatClient {
     }
 
     async fn run(&mut self, terminal: &mut Terminal<CrosstermBackend<io::Stdout>>) -> io::Result<()> {
-        // Connect to server
         self.connect().await?;
 
         let mut last_tick = Instant::now();
         let tick_rate = Duration::from_millis(50);
 
         loop {
-            // Check for authentication updates
             if let Some(auth_receiver) = &mut self.auth_receiver {
                 if let Ok(auth_success) = auth_receiver.try_recv() {
                     if auth_success {
                         self.authenticated = true;
                         self.username = self.auth_username.clone();
                         self.auth_error = None;
-                        // Clear password for security
                         self.auth_password.clear();
                     } else {
                         self.auth_error = Some("Authentication failed".to_string());
@@ -200,20 +189,16 @@ impl TuiChatClient {
         let read_stream = stream.try_clone()?;
         let write_stream = stream.try_clone()?;
 
-        // Setup message channels
         let (tx, mut rx) = mpsc::unbounded_channel();
         self.message_sender = Some(tx);
 
-        // Setup authentication feedback channel
         let (auth_tx, auth_rx) = mpsc::unbounded_channel();
         self.auth_receiver = Some(auth_rx);
 
-        // Start message receiver thread
         thread::spawn(move || {
             Self::message_receiver(read_stream, auth_tx);
         });
 
-        // Start message sender task
         tokio::spawn(async move {
             let mut stream = write_stream;
             while let Some(message) = rx.recv().await {
@@ -233,7 +218,6 @@ impl TuiChatClient {
             match line {
                 Ok(json_message) => {
                     if let Ok(message) = Message::from_json_file(&json_message) {
-                        // Handle authentication responses
                         match &message.message_type {
                             MessageType::AuthSuccess { user_id: _, message: msg } => {
                                 println!("Authentication successful! Message: {}", msg);
@@ -478,7 +462,6 @@ impl TuiChatClient {
     fn draw_auth_screen(&self, f: &mut Frame) {
         let size = f.area();
         
-        // Center the auth dialog
         let popup_area = Self::centered_rect(60, 40, size);
         f.render_widget(Clear, popup_area);
         
@@ -499,7 +482,6 @@ impl TuiChatClient {
             ])
             .split(inner);
 
-        // Username field
         let username_style = if self.auth_field == AuthField::Username {
             Style::default().fg(Color::Yellow)
         } else {
@@ -509,7 +491,6 @@ impl TuiChatClient {
             .block(Block::default().title("Username").borders(Borders::ALL).style(username_style));
         f.render_widget(username, chunks[0]);
 
-        // Password field
         let password_style = if self.auth_field == AuthField::Password {
             Style::default().fg(Color::Yellow)
         } else {
@@ -520,7 +501,6 @@ impl TuiChatClient {
             .block(Block::default().title("Password").borders(Borders::ALL).style(password_style));
         f.render_widget(password, chunks[1]);
 
-        // Instructions
         let instructions = vec![
             Line::from(vec![
                 Span::raw("Tab: Switch fields | F2: Toggle "),
@@ -535,7 +515,6 @@ impl TuiChatClient {
             .block(Block::default().title("Controls").borders(Borders::ALL));
         f.render_widget(help, chunks[2]);
 
-        // Error message
         if let Some(error) = &self.auth_error {
             let error_msg = Paragraph::new(error.as_str())
                 .style(Style::default().fg(Color::Red))
@@ -547,7 +526,6 @@ impl TuiChatClient {
     fn draw_main_screen(&self, f: &mut Frame) {
         let size = f.area();
         
-        // Main layout
         let chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
@@ -559,13 +537,11 @@ impl TuiChatClient {
             ])
             .split(size);
 
-        // Header
         let header = Paragraph::new(format!("FCA - Connected as: {}", self.username))
             .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
             .block(Block::default().borders(Borders::ALL));
         f.render_widget(header, chunks[0]);
 
-        // Room tabs
         let room_titles: Vec<String> = self.joined_rooms.iter()
             .filter_map(|&id| self.rooms.get(&id))
             .map(|room| format!("{}({})", room.name, room.user_count))
@@ -582,22 +558,18 @@ impl TuiChatClient {
             .select(selected_tab);
         f.render_widget(tabs, chunks[1]);
 
-        // Chat messages
         let chat_area = chunks[2];
         self.draw_chat_area(f, chat_area);
 
-        // Input field
         let input = Paragraph::new(self.input.as_str())
             .style(Style::default().fg(Color::White))
             .block(Block::default().borders(Borders::ALL).title("Message"));
         f.render_widget(input, chunks[3]);
 
-        // Status bar
         let status = Paragraph::new("Commands: F1-Help F2-Rooms F3-Private F4-Settings ESC-Quit")
             .style(Style::default().fg(Color::Gray));
         f.render_widget(status, chunks[4]);
 
-        // Overlays
         if self.show_help {
             self.draw_help_popup(f);
         }
