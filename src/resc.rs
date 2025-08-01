@@ -1,15 +1,7 @@
-/*
- Oh yeah yeah, shared resources module! yeah yeah
-*/
-
 #![allow(dead_code)]
 
 use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
-
-
-// ? User module down
-
 
 pub struct User{
     pub id: u16,
@@ -44,8 +36,6 @@ impl User {
         self.subscribed_rooms.retain(|room| room.id != room_id);
     }
 }
-
-// ? Room module down
 
 #[derive(Clone)]
 pub enum RoomState{
@@ -100,8 +90,6 @@ impl Room {
     }
 }
 
-// ? Message module down
-
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MessageType {
     Register {username: String, password: String},
@@ -117,6 +105,27 @@ pub enum MessageType {
     RoomMessage {room_id: u16, sender_username: String, content: String},
     PrivateMessage {to_user_id: u16, sender_username: String, content: String},
     ServerResponse {success: bool, content: String},
+    ListRooms,
+    RoomList {rooms: Vec<RoomInfo>},
+    UserStatusUpdate {user_id: u16, username: String, is_online: bool},
+    UserListUpdate {users: Vec<UserStatus>},
+    RequestUserList,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct RoomInfo {
+    pub id: u16,
+    pub name: String,
+    pub description: String,
+    pub is_password_protected: bool,
+}
+
+#[derive(Serialize, Deserialize, Debug, Clone)]
+pub struct UserStatus {
+    pub user_id: u16,
+    pub username: String,
+    pub is_online: bool,
+    pub last_seen: String, // formatted timestamp
 }
 
 
@@ -143,8 +152,6 @@ impl Message {
     }
 
 }
-
-// ? Account module down
 
 #[derive(Debug, Clone)]
 pub struct Account {

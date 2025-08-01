@@ -103,7 +103,7 @@ cargo run -- client YourUsername
 
 ```bash
 # Terminal 1 - Start server
-$ cargo run -- server
+$ cargo run -- async-server
 Starting TCP Chat Server...
 Server listening to [127.0.0.1:8080]
 
@@ -177,6 +177,6 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - [X] Add user authentication
 - [x] Add password-protected private rooms
 - [x] Implement descriptive room system
-- [ ] Implement admin commands
+- [X] Implement admin commands
 - [ ] Add message history
 - [ ] WebSocket support

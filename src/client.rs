@@ -136,6 +136,29 @@ impl ChatClient {
             MessageType::Join { .. } | MessageType::Leave { .. } | MessageType::CreateRoom { .. } => {
                 println!("[Debug] Received unexpected room action message");
             }
+            MessageType::ListRooms => {
+                println!("[Debug] Received ListRooms request");
+            }
+            MessageType::RoomList { rooms } => {
+                println!("Available rooms:");
+                for room in rooms {
+                    println!("  [{}] {} - {}", room.id, room.name, room.description);
+                }
+            }
+            MessageType::UserStatusUpdate { user_id, username, is_online } => {
+                let status = if is_online { "online" } else { "offline" };
+                println!("User {} ({}) is now {}", username, user_id, status);
+            }
+            MessageType::UserListUpdate { users } => {
+                println!("Online users:");
+                for user in users {
+                    let status = if user.is_online { "●" } else { "○" };
+                    println!("  {} {}", status, user.username);
+                }
+            }
+            MessageType::RequestUserList => {
+                println!("[Debug] Received RequestUserList");
+            }
         }
     }
 

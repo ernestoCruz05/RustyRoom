@@ -6,7 +6,7 @@
  real-time messaging, and intuitive navigation.
 */
 
-use crate::resc::{Message, MessageType};
+use crate::resc::{Message, MessageType, UserStatus, RoomInfo};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
     execute,
@@ -30,11 +30,16 @@ use std::{
 use tokio::sync::mpsc;
 
 #[derive(Debug, Clone)]
-pub struct ChatMessage {
-    pub timestamp: String,
-    pub sender: String,
-    pub content: String,
-    pub message_type: ChatMessageType,
+pub enum UIUpdate {
+    AuthSuccess { user_id: u16, username: String },
+    AuthFailure { reason: String },
+    RoomCreated { room_id: u16, name: String, description: String },
+    RoomJoined { room_id: u16, name: String, description: String },
+    RoomMessage { room_id: u16, sender: String, content: String },
+    ServerMessage { content: String, is_error: bool },
+    UserListUpdate { users: Vec<UserStatus> },
+    RoomList { rooms: Vec<RoomInfo> },
+    PrivateMessage { from_user_id: u16, sender: String, content: String },
 }
 
 #[derive(Debug, Clone)]
@@ -43,6 +48,14 @@ pub enum ChatMessageType {
     System,
     Private,
     Error,
+}
+
+#[derive(Debug, Clone)]
+pub struct ChatMessage {
+    pub timestamp: String,
+    pub sender: String,
+    pub content: String,
+    pub message_type: ChatMessageType,
 }
 
 #[derive(Debug, Clone)]
@@ -70,7 +83,14 @@ pub struct TuiChatClient {
     show_help: bool,
     show_room_browser: bool,
     show_settings: bool,
+    show_private_messages: bool,
     cursor_position: usize,
+    
+    available_rooms: Vec<RoomInfo>,
+    selected_room_index: usize,
+    private_conversations: HashMap<u16, Vec<ChatMessage>>,
+    selected_private_user: Option<u16>,
+    selected_user_index: usize,
     
     auth_mode: AuthMode,
     auth_username: String,
@@ -79,7 +99,10 @@ pub struct TuiChatClient {
     auth_error: Option<String>,
     
     message_sender: Option<mpsc::UnboundedSender<Message>>,
-    auth_receiver: Option<mpsc::UnboundedReceiver<bool>>,
+    ui_receiver: Option<mpsc::UnboundedReceiver<UIUpdate>>,
+    online_users: Vec<UserStatus>,
+    cursor_visible: bool,
+    last_cursor_toggle: Instant,
 }
 
 #[derive(Debug, Clone, PartialEq)]
@@ -108,6 +131,7 @@ impl TuiChatClient {
             show_help: false,
             show_room_browser: false,
             show_settings: false,
+            show_private_messages: false,
             cursor_position: 0,
             auth_mode: AuthMode::Login,
             auth_username: String::new(),
@@ -115,7 +139,15 @@ impl TuiChatClient {
             auth_field: AuthField::Username,
             auth_error: None,
             message_sender: None,
-            auth_receiver: None,
+            ui_receiver: None,
+            online_users: Vec::new(),
+            cursor_visible: true,
+            last_cursor_toggle: Instant::now(),
+            available_rooms: Vec::new(),
+            selected_room_index: 0,
+            private_conversations: HashMap::new(),
+            selected_private_user: None,
+            selected_user_index: 0,
         }
     }
 
@@ -147,20 +179,73 @@ impl TuiChatClient {
         let tick_rate = Duration::from_millis(50);
 
         loop {
-            if let Some(auth_receiver) = &mut self.auth_receiver {
-                if let Ok(auth_success) = auth_receiver.try_recv() {
-                    if auth_success {
-                        self.authenticated = true;
-                        self.username = self.auth_username.clone();
-                        self.auth_error = None;
-                        self.auth_password.clear();
-                    } else {
-                        self.auth_error = Some("Authentication failed".to_string());
+            if let Some(ui_receiver) = &mut self.ui_receiver {
+                if let Ok(ui_update) = ui_receiver.try_recv() {
+                    match ui_update {
+                        UIUpdate::AuthSuccess { user_id, username } => {
+                            self.authenticated = true;
+                            self.user_id = user_id;
+                            self.username = username;
+                            self.auth_error = None;
+                            self.auth_password.clear();
+                        }
+                        UIUpdate::AuthFailure { reason } => {
+                            self.auth_error = Some(reason);
+                        }
+                        UIUpdate::UserListUpdate { users } => {
+                            self.online_users = users;
+                        }
+                        UIUpdate::RoomList { rooms } => {
+                            self.available_rooms = rooms;
+                            self.selected_room_index = 0;
+                        }
+                        UIUpdate::RoomJoined { room_id, name, description } => {
+                            if !self.joined_rooms.contains(&room_id) {
+                                self.joined_rooms.push(room_id);
+                            }
+                            if self.current_room.is_none() {
+                                self.current_room = Some(room_id);
+                            }
+                            let room = Room {
+                                id: room_id,
+                                name,
+                                description,
+                                user_count: 1,
+                                messages: Vec::new(),
+                            };
+                            self.rooms.insert(room_id, room);
+                        }
+                        UIUpdate::RoomMessage { room_id, sender, content } => {
+                            if let Some(room) = self.rooms.get_mut(&room_id) {
+                                let message = ChatMessage {
+                                    timestamp: Self::current_time(),
+                                    sender,
+                                    content,
+                                    message_type: ChatMessageType::User,
+                                };
+                                room.messages.push(message);
+                            }
+                        }
+                        UIUpdate::PrivateMessage { from_user_id, sender, content } => {
+                            let message = ChatMessage {
+                                timestamp: Self::current_time(),
+                                sender,
+                                content,
+                                message_type: ChatMessageType::Private,
+                            };
+                            self.private_conversations.entry(from_user_id).or_insert_with(Vec::new).push(message);
+                        }
+                        _ => {}
                     }
                 }
             }
 
             terminal.draw(|f| self.draw(f))?;
+
+            if last_tick.elapsed() >= Duration::from_millis(500) {
+                self.cursor_visible = !self.cursor_visible;
+                self.last_cursor_toggle = Instant::now();
+            }
 
             let timeout = tick_rate
                 .checked_sub(last_tick.elapsed())
@@ -192,11 +277,11 @@ impl TuiChatClient {
         let (tx, mut rx) = mpsc::unbounded_channel();
         self.message_sender = Some(tx);
 
-        let (auth_tx, auth_rx) = mpsc::unbounded_channel();
-        self.auth_receiver = Some(auth_rx);
+        let (ui_tx, ui_rx) = mpsc::unbounded_channel();
+        self.ui_receiver = Some(ui_rx);
 
         thread::spawn(move || {
-            Self::message_receiver(read_stream, auth_tx);
+            Self::message_receiver(read_stream, ui_tx);
         });
 
         tokio::spawn(async move {
@@ -209,26 +294,67 @@ impl TuiChatClient {
             }
         });
 
+        if let Some(sender) = &self.message_sender {
+            let request = Message::new(0, MessageType::RequestUserList);
+            let _ = sender.send(request);
+        }
+
         Ok(())
     }
 
-    fn message_receiver(stream: TcpStream, auth_sender: mpsc::UnboundedSender<bool>) {
+    fn message_receiver(stream: TcpStream, ui_sender: mpsc::UnboundedSender<UIUpdate>) {
         let reader = BufReader::new(stream);
         for line in reader.lines() {
             match line {
                 Ok(json_message) => {
                     if let Ok(message) = Message::from_json_file(&json_message) {
                         match &message.message_type {
-                            MessageType::AuthSuccess { user_id: _, message: msg } => {
+                            MessageType::AuthSuccess { user_id, message: msg } => {
                                 println!("Authentication successful! Message: {}", msg);
-                                let _ = auth_sender.send(true);
+                                let _ = ui_sender.send(UIUpdate::AuthSuccess { 
+                                    user_id: *user_id, 
+                                    username: msg.clone() 
+                                });
                             }
                             MessageType::AuthFailure { reason } => {
                                 println!("Authentication failed: {}", reason);
-                                let _ = auth_sender.send(false);
+                                let _ = ui_sender.send(UIUpdate::AuthFailure { 
+                                    reason: reason.clone() 
+                                });
                             }
                             MessageType::RoomCreated { room_id: _, name, description: _ } => {
                                 println!("Room '{}' created successfully!", name);
+                            }
+                            MessageType::RoomJoined { room_id, name, description } => {
+                                let _ = ui_sender.send(UIUpdate::RoomJoined {
+                                    room_id: *room_id,
+                                    name: name.clone(),
+                                    description: description.clone(),
+                                });
+                            }
+                            MessageType::RoomMessage { room_id, sender_username, content } => {
+                                let _ = ui_sender.send(UIUpdate::RoomMessage {
+                                    room_id: *room_id,
+                                    sender: sender_username.clone(),
+                                    content: content.clone(),
+                                });
+                            }
+                            MessageType::UserListUpdate { users } => {
+                                let _ = ui_sender.send(UIUpdate::UserListUpdate {
+                                    users: users.clone(),
+                                });
+                            }
+                            MessageType::RoomList { rooms } => {
+                                let _ = ui_sender.send(UIUpdate::RoomList {
+                                    rooms: rooms.clone(),
+                                });
+                            }
+                            MessageType::PrivateMessage { to_user_id: _, sender_username, content } => {
+                                let _ = ui_sender.send(UIUpdate::PrivateMessage {
+                                    from_user_id: message.sender_id,
+                                    sender: sender_username.clone(),
+                                    content: content.clone(),
+                                });
                             }
                             _ => {}
                         }
@@ -255,23 +381,61 @@ impl TuiChatClient {
 
         match key {
             KeyCode::Esc => {
-                if self.show_help || self.show_room_browser || self.show_settings {
+                if self.show_help || self.show_room_browser || self.show_settings || self.show_private_messages {
                     self.show_help = false;
                     self.show_room_browser = false;
                     self.show_settings = false;
+                    self.show_private_messages = false;
                 } else {
-                    return Ok(true); // Exit
+                    return Ok(true);
                 }
             }
             KeyCode::F(1) => self.show_help = !self.show_help,
-            KeyCode::F(2) => self.show_room_browser = !self.show_room_browser,
+            KeyCode::F(2) => {
+                self.show_room_browser = !self.show_room_browser;
+                if self.show_room_browser {
+                    if let Some(sender) = &self.message_sender {
+                        let message = Message::new(self.user_id, MessageType::ListRooms);
+                        let _ = sender.send(message);
+                    }
+                }
+            }
             KeyCode::F(3) => {
-                // TODO: Implement private message interface
+                self.show_private_messages = !self.show_private_messages;
+                if self.show_private_messages {
+                    self.selected_user_index = 0;
+                    self.update_selected_private_user();
+                }
             }
             KeyCode::F(4) => self.show_settings = !self.show_settings,
             KeyCode::Enter => {
-                if !self.input.is_empty() {
-                    self.send_message().await?;
+                if self.show_room_browser {
+                    if !self.available_rooms.is_empty() && self.selected_room_index < self.available_rooms.len() {
+                        let room = &self.available_rooms[self.selected_room_index];
+                        if let Some(sender) = &self.message_sender {
+                            let message = Message::new(self.user_id, MessageType::Join { 
+                                room_id: room.id, 
+                                password: None 
+                            });
+                            let _ = sender.send(message);
+                        }
+                        self.show_room_browser = false;
+                    }
+                } else if self.show_private_messages {
+                    self.update_selected_private_user();
+                } else if !self.input.is_empty() {
+                    if self.show_private_messages && self.selected_private_user.is_some() {
+                        if let Some(sender) = &self.message_sender {
+                            let message = Message::new(self.user_id, MessageType::PrivateMessage {
+                                to_user_id: self.selected_private_user.unwrap(),
+                                sender_username: self.username.clone(),
+                                content: self.input.clone(),
+                            });
+                            let _ = sender.send(message);
+                        }
+                    } else {
+                        self.send_message().await?;
+                    }
                     self.input.clear();
                     self.cursor_position = 0;
                 }
@@ -283,13 +447,48 @@ impl TuiChatClient {
                 }
             }
             KeyCode::Left => {
-                if self.cursor_position > 0 {
+                if self.show_room_browser {
+                    if self.selected_room_index > 0 {
+                        self.selected_room_index -= 1;
+                    }
+                } else if self.cursor_position > 0 {
                     self.cursor_position -= 1;
                 }
             }
             KeyCode::Right => {
-                if self.cursor_position < self.input.len() {
+                if self.show_room_browser {
+                    if self.selected_room_index < self.available_rooms.len().saturating_sub(1) {
+                        self.selected_room_index += 1;
+                    }
+                } else if self.cursor_position < self.input.len() {
                     self.cursor_position += 1;
+                }
+            }
+            KeyCode::Up => {
+                if self.show_room_browser {
+                    if self.selected_room_index > 0 {
+                        self.selected_room_index -= 1;
+                    }
+                } else if self.show_private_messages {
+                    if self.selected_user_index > 0 {
+                        self.selected_user_index -= 1;
+                        self.update_selected_private_user();
+                    }
+                }
+            }
+            KeyCode::Down => {
+                if self.show_room_browser {
+                    if self.selected_room_index < self.available_rooms.len().saturating_sub(1) {
+                        self.selected_room_index += 1;
+                    }
+                } else if self.show_private_messages {
+                    let user_count = self.online_users.iter()
+                        .filter(|user| user.user_id != self.user_id)
+                        .count();
+                    if self.selected_user_index < user_count.saturating_sub(1) {
+                        self.selected_user_index += 1;
+                        self.update_selected_private_user();
+                    }
                 }
             }
             KeyCode::Tab => {
@@ -306,7 +505,7 @@ impl TuiChatClient {
 
     async fn handle_auth_key_event(&mut self, key: KeyCode) -> io::Result<bool> {
         match key {
-            KeyCode::Esc => return Ok(true), // Exit
+            KeyCode::Esc => return Ok(true),
             KeyCode::Tab => {
                 self.auth_field = match self.auth_field {
                     AuthField::Username => AuthField::Password,
@@ -321,13 +520,13 @@ impl TuiChatClient {
                 self.auth_error = None;
             }
             KeyCode::Enter => {
-                println!("Enter key pressed in auth mode"); // Debug
+                println!("Enter key pressed in auth mode");
                 if !self.auth_username.is_empty() && !self.auth_password.is_empty() {
-                    println!("Attempting to send auth message"); // Debug
+                    println!("Attempting to send auth message");
                     self.send_auth_message().await?;
                 } else {
                     println!("Auth fields empty - username: '{}', password: '{}'", 
-                            self.auth_username, "*".repeat(self.auth_password.len())); // Debug
+                            self.auth_username, "*".repeat(self.auth_password.len()));
                 }
             }
             KeyCode::Backspace => {
@@ -406,19 +605,21 @@ impl TuiChatClient {
                     }
                 }
                 Some(&"/create") => {
-                    if parts.len() >= 4 {
-                        if let Ok(room_id) = parts[1].parse::<u16>() {
-                            let name = parts[2].to_string();
-                            let description = parts[3].to_string();
-                            let password = if parts.len() > 4 {
-                                Some(parts[4].to_string())
-                            } else {
-                                None
-                            };
-                            let message = Message::new(self.user_id, MessageType::CreateRoom {
-                                room_id, name, description, password
-                            });
-                            let _ = sender.send(message);
+                    if let Some(args) = Self::parse_quoted_args(&self.input) {
+                        if args.len() >= 4 {
+                            if let Ok(room_id) = args[1].parse::<u16>() {
+                                let name = args[2].clone();
+                                let description = args[3].clone();
+                                let password = if args.len() > 4 {
+                                    Some(args[4].clone())
+                                } else {
+                                    None
+                                };
+                                let message = Message::new(self.user_id, MessageType::CreateRoom {
+                                    room_id, name, description, password
+                                });
+                                let _ = sender.send(message);
+                            }
                         }
                     }
                 }
@@ -440,6 +641,52 @@ impl TuiChatClient {
             }
         }
         Ok(())
+    }
+
+    fn parse_quoted_args(input: &str) -> Option<Vec<String>> {
+        let mut args = Vec::new();
+        let mut current_arg = String::new();
+        let mut in_quotes = false;
+        let mut chars = input.chars().peekable();
+        
+        while let Some(ch) = chars.next() {
+            match ch {
+                '"' => {
+                    in_quotes = !in_quotes;
+                }
+                ' ' if !in_quotes => {
+                    if !current_arg.is_empty() {
+                        args.push(current_arg.trim().to_string());
+                        current_arg.clear();
+                    }
+                }
+                _ => {
+                    current_arg.push(ch);
+                }
+            }
+        }
+        
+        if !current_arg.is_empty() {
+            args.push(current_arg.trim().to_string());
+        }
+        
+        if args.is_empty() {
+            None
+        } else {
+            Some(args)
+        }
+    }
+
+    fn update_selected_private_user(&mut self) {
+        let other_users: Vec<&UserStatus> = self.online_users.iter()
+            .filter(|user| user.user_id != self.user_id)
+            .collect();
+        
+        if !other_users.is_empty() && self.selected_user_index < other_users.len() {
+            self.selected_private_user = Some(other_users[self.selected_user_index].user_id);
+        } else {
+            self.selected_private_user = None;
+        }
     }
 
     fn switch_room(&mut self) {
@@ -526,7 +773,17 @@ impl TuiChatClient {
     fn draw_main_screen(&self, f: &mut Frame) {
         let size = f.area();
         
-        let chunks = Layout::default()
+        // Main layout - horizontal split for chat area and user panel
+        let main_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(75), // Chat area
+                Constraint::Percentage(25), // User panel
+            ])
+            .split(size);
+        
+        // Left side - chat interface
+        let left_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
                 Constraint::Length(3), // Header
@@ -535,12 +792,12 @@ impl TuiChatClient {
                 Constraint::Length(3), // Input
                 Constraint::Length(1), // Status bar
             ])
-            .split(size);
+            .split(main_chunks[0]);
 
         let header = Paragraph::new(format!("FCA - Connected as: {}", self.username))
             .style(Style::default().fg(Color::Cyan).add_modifier(Modifier::BOLD))
             .block(Block::default().borders(Borders::ALL));
-        f.render_widget(header, chunks[0]);
+        f.render_widget(header, left_chunks[0]);
 
         let room_titles: Vec<String> = self.joined_rooms.iter()
             .filter_map(|&id| self.rooms.get(&id))
@@ -556,19 +813,31 @@ impl TuiChatClient {
             .style(Style::default().fg(Color::White))
             .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
             .select(selected_tab);
-        f.render_widget(tabs, chunks[1]);
+        f.render_widget(tabs, left_chunks[1]);
 
-        let chat_area = chunks[2];
+        let chat_area = left_chunks[2];
         self.draw_chat_area(f, chat_area);
 
-        let input = Paragraph::new(self.input.as_str())
+        // Input field with cursor
+        let input_text = if self.cursor_visible {
+            let mut text = self.input.clone();
+            text.insert(self.cursor_position, '│');
+            text
+        } else {
+            self.input.clone()
+        };
+        
+        let input = Paragraph::new(input_text.as_str())
             .style(Style::default().fg(Color::White))
             .block(Block::default().borders(Borders::ALL).title("Message"));
-        f.render_widget(input, chunks[3]);
+        f.render_widget(input, left_chunks[3]);
 
         let status = Paragraph::new("Commands: F1-Help F2-Rooms F3-Private F4-Settings ESC-Quit")
             .style(Style::default().fg(Color::Gray));
-        f.render_widget(status, chunks[4]);
+        f.render_widget(status, left_chunks[4]);
+        
+        // Right side - user panel
+        self.draw_user_panel(f, main_chunks[1]);
 
         if self.show_help {
             self.draw_help_popup(f);
@@ -578,6 +847,42 @@ impl TuiChatClient {
         }
         if self.show_settings {
             self.draw_settings(f);
+        }
+        if self.show_private_messages {
+            self.draw_private_messages(f);
+        }
+    }
+
+    fn draw_user_panel(&self, f: &mut Frame, area: Rect) {
+        let block = Block::default()
+            .title("Online Users")
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Green));
+
+        if self.online_users.is_empty() {
+            let empty_text = Paragraph::new("No users online\n\nPress F3 for\nprivate messages")
+                .style(Style::default().fg(Color::Gray))
+                .alignment(Alignment::Center)
+                .block(block);
+            f.render_widget(empty_text, area);
+        } else {
+            let user_items: Vec<ListItem> = self.online_users.iter()
+                .map(|user| {
+                    let status_icon = if user.is_online { "●" } else { "○" };
+                    let style = if user.is_online {
+                        Style::default().fg(Color::Green)
+                    } else {
+                        Style::default().fg(Color::Gray)
+                    };
+                    
+                    let display = format!("{} {}", status_icon, user.username);
+                    ListItem::new(display).style(style)
+                })
+                .collect();
+
+            let user_list = List::new(user_items)
+                .block(block);
+            f.render_widget(user_list, area);
         }
     }
 
@@ -647,14 +952,129 @@ impl TuiChatClient {
     }
 
     fn draw_room_browser(&self, f: &mut Frame) {
-        let popup_area = Self::centered_rect(60, 40, f.area());
+        let popup_area = Self::centered_rect(70, 50, f.area());
         f.render_widget(Clear, popup_area);
         
-        let block = Block::default().title("Room Browser").borders(Borders::ALL);
-        let content = Paragraph::new("Room browser not yet implemented.\nUse /join <room_id> to join a room.")
-            .block(block)
-            .wrap(Wrap { trim: true });
-        f.render_widget(content, popup_area);
+        let block = Block::default()
+            .title("Room Browser")
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Cyan));
+
+        if self.available_rooms.is_empty() {
+            let content = Paragraph::new("Loading rooms...\n\nPress Esc to close")
+                .block(block)
+                .alignment(Alignment::Center)
+                .wrap(Wrap { trim: true });
+            f.render_widget(content, popup_area);
+        } else {
+            let inner = popup_area.inner(ratatui::layout::Margin { horizontal: 2, vertical: 2 });
+            let chunks = Layout::default()
+                .direction(Direction::Vertical)
+                .constraints([
+                    Constraint::Min(1),
+                    Constraint::Length(3),
+                ])
+                .split(inner);
+
+            let room_items: Vec<ListItem> = self.available_rooms.iter()
+                .enumerate()
+                .map(|(i, room)| {
+                    let style = if i == self.selected_room_index {
+                        Style::default().bg(Color::Yellow).fg(Color::Black).add_modifier(Modifier::BOLD)
+                    } else {
+                        Style::default()
+                    };
+                    
+                    let lock_icon = if room.is_password_protected { "🔒 " } else { "" };
+                    let content = format!("  [{}] {}{} - {}", room.id, lock_icon, room.name, room.description);
+                    ListItem::new(content).style(style)
+                })
+                .collect();
+
+            let room_list = List::new(room_items)
+                .block(Block::default().borders(Borders::ALL).title("Available Rooms"));
+            f.render_widget(room_list, chunks[0]);
+
+            let instructions = vec![
+                Line::from("↑↓ Navigate | Enter: Join Room | Esc: Close"),
+                Line::from("🔒 = Password Protected Room"),
+            ];
+            let help = Paragraph::new(instructions)
+                .block(Block::default().borders(Borders::ALL).title("Controls"))
+                .alignment(Alignment::Center);
+            f.render_widget(help, chunks[1]);
+            
+            f.render_widget(block, popup_area);
+        }
+    }
+
+    fn draw_private_messages(&self, f: &mut Frame) {
+        let popup_area = Self::centered_rect(70, 60, f.area());
+        f.render_widget(Clear, popup_area);
+        
+        let block = Block::default()
+            .title("Private Messages")
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Magenta));
+
+        let inner = popup_area.inner(ratatui::layout::Margin { horizontal: 2, vertical: 2 });
+        let chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([
+                Constraint::Percentage(30), // User list
+                Constraint::Percentage(70), // Messages
+            ])
+            .split(inner);
+
+        // Left side - online users list
+        let user_items: Vec<ListItem> = self.online_users.iter()
+            .filter(|user| user.user_id != self.user_id) // Don't show self
+            .map(|user| {
+                let style = if Some(user.user_id) == self.selected_private_user {
+                    Style::default().bg(Color::Magenta).fg(Color::White).add_modifier(Modifier::BOLD)
+                } else if user.is_online {
+                    Style::default().fg(Color::Green)
+                } else {
+                    Style::default().fg(Color::Gray)
+                };
+                
+                let status_icon = if user.is_online { "●" } else { "○" };
+                let display = format!("{} {}", status_icon, user.username);
+                ListItem::new(display).style(style)
+            })
+            .collect();
+
+        let user_list = List::new(user_items)
+            .block(Block::default().borders(Borders::ALL).title("Users"));
+        f.render_widget(user_list, chunks[0]);
+
+        // Right side - message area
+        if let Some(selected_user) = self.selected_private_user {
+            if let Some(messages) = self.private_conversations.get(&selected_user) {
+                let message_items: Vec<ListItem> = messages.iter()
+                    .map(|msg| {
+                        let content = format!("[{}] {}: {}", msg.timestamp, msg.sender, msg.content);
+                        ListItem::new(content).style(Style::default().fg(Color::White))
+                    })
+                    .collect();
+
+                let message_list = List::new(message_items)
+                    .block(Block::default().borders(Borders::ALL).title("Messages"));
+                f.render_widget(message_list, chunks[1]);
+            } else {
+                let empty_msg = Paragraph::new("No messages yet.\nType a message to start conversation.")
+                    .block(Block::default().borders(Borders::ALL).title("Messages"))
+                    .alignment(Alignment::Center);
+                f.render_widget(empty_msg, chunks[1]);
+            }
+        } else {
+            let instructions = Paragraph::new("Select a user from the list\nto start a private conversation.\n\n↑↓ Navigate | Enter: Select\nEsc: Close")
+                .block(Block::default().borders(Borders::ALL).title("Instructions"))
+                .alignment(Alignment::Center);
+            f.render_widget(instructions, chunks[1]);
+        }
+
+        f.render_widget(block, popup_area);
     }
 
     fn draw_settings(&self, f: &mut Frame) {

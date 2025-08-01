@@ -1,12 +1,9 @@
-/*
- Entry point oh yeah!
-*/
-
 mod resc;
 mod server;
 mod client;
 mod tui_client;
-use server::ChatServer;
+mod database;
+use server::{ChatServer, AsyncChatServer};
 use client::ChatClient;
 use tui_client::TuiChatClient;
 use std::env;
@@ -20,6 +17,38 @@ async fn main() {
             println!("Starting TCP Chat Server...");
             if let Err(e) = ChatServer::start_server("127.0.0.1:8080") {
                 eprintln!("Failed to start server: {}", e);
+            }
+        }
+        Some("async-server") => {
+            println!("Starting Async TCP Chat Server with database...");
+            
+            // Ensure we can write to the current directory
+            let current_dir = match env::current_dir() {
+                Ok(dir) => dir,
+                Err(e) => {
+                    eprintln!("Cannot determine current directory: {}", e);
+                    return;
+                }
+            };
+            
+            let db_path = current_dir.join("chat.db");
+            println!("Database file: {}", db_path.display());
+            
+            // Check if we can write to this directory
+            if let Err(e) = std::fs::OpenOptions::new()
+                .create(true)
+                .write(true)
+                .open(&db_path) {
+                eprintln!("Cannot create database file at {}: {}", db_path.display(), e);
+                eprintln!("Please check directory permissions or run from a writable directory");
+                return;
+            }
+            
+            let db_url = format!("sqlite:{}", db_path.display());
+            
+            if let Err(e) = AsyncChatServer::start_async_server(&db_url, "127.0.0.1:8080").await {
+                eprintln!("Failed to start async server: {}", e);
+                eprintln!("Fallback: Try running 'cargo run server' for non-persistent chat");
             }
         }
         Some("client") => {
