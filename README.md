@@ -1,4 +1,4 @@
-# FCA - TCP Chat Server
+# RustyRoom - TCP Chat Server
 
 A multi-threaded TCP chat server written in Rust that allows multiple clients to connect and chat in different rooms.
 
