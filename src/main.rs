@@ -3,7 +3,7 @@ mod server;
 mod client;
 mod tui_client;
 mod database;
-use server::{ChatServer, AsyncChatServer};
+use server::AsyncChatServer;
 use client::ChatClient;
 use tui_client::TuiChatClient;
 use std::env;
@@ -14,15 +14,8 @@ async fn main() {
     
     match args.get(1).map(|s| s.as_str()) {
         Some("server") => {
-            println!("Starting TCP Chat Server...");
-            if let Err(e) = ChatServer::start_server("127.0.0.1:8080") {
-                eprintln!("Failed to start server: {}", e);
-            }
-        }
-        Some("async-server") => {
             println!("Starting Async TCP Chat Server with database...");
             
-            // Ensure we can write to the current directory
             let current_dir = match env::current_dir() {
                 Ok(dir) => dir,
                 Err(e) => {
@@ -34,7 +27,6 @@ async fn main() {
             let db_path = current_dir.join("chat.db");
             println!("Database file: {}", db_path.display());
             
-            // Check if we can write to this directory
             if let Err(e) = std::fs::OpenOptions::new()
                 .create(true)
                 .write(true)
@@ -48,7 +40,6 @@ async fn main() {
             
             if let Err(e) = AsyncChatServer::start_async_server(&db_url, "127.0.0.1:8080").await {
                 eprintln!("Failed to start async server: {}", e);
-                eprintln!("Fallback: Try running 'cargo run server' for non-persistent chat");
             }
         }
         Some("client") => {
@@ -67,7 +58,7 @@ async fn main() {
             println!("FCA - TCP Chat Application");
             println!();
             println!("Usage:");
-            println!("  cargo run server              - Start chat server");
+            println!("  cargo run server              - Start async chat server with database");
             println!("  cargo run client <username>   - Start CLI client");
             println!("  cargo run tui                 - Start TUI client (recommended)");
             println!();

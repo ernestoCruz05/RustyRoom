@@ -773,24 +773,22 @@ impl TuiChatClient {
     fn draw_main_screen(&self, f: &mut Frame) {
         let size = f.area();
         
-        // Main layout - horizontal split for chat area and user panel
         let main_chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(75), // Chat area
-                Constraint::Percentage(25), // User panel
+                Constraint::Percentage(75),
+                Constraint::Percentage(25),
             ])
             .split(size);
         
-        // Left side - chat interface
         let left_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3), // Header
-                Constraint::Length(3), // Room tabs
-                Constraint::Min(1),    // Chat area
-                Constraint::Length(3), // Input
-                Constraint::Length(1), // Status bar
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Min(1),   
+                Constraint::Length(3),
+                Constraint::Length(1),
             ])
             .split(main_chunks[0]);
 
@@ -818,7 +816,6 @@ impl TuiChatClient {
         let chat_area = left_chunks[2];
         self.draw_chat_area(f, chat_area);
 
-        // Input field with cursor
         let input_text = if self.cursor_visible {
             let mut text = self.input.clone();
             text.insert(self.cursor_position, '│');
@@ -836,7 +833,6 @@ impl TuiChatClient {
             .style(Style::default().fg(Color::Gray));
         f.render_widget(status, left_chunks[4]);
         
-        // Right side - user panel
         self.draw_user_panel(f, main_chunks[1]);
 
         if self.show_help {
@@ -1021,14 +1017,13 @@ impl TuiChatClient {
         let chunks = Layout::default()
             .direction(Direction::Horizontal)
             .constraints([
-                Constraint::Percentage(30), // User list
-                Constraint::Percentage(70), // Messages
+                Constraint::Percentage(30),
+                Constraint::Percentage(70),
             ])
             .split(inner);
 
-        // Left side - online users list
         let user_items: Vec<ListItem> = self.online_users.iter()
-            .filter(|user| user.user_id != self.user_id) // Don't show self
+            .filter(|user| user.user_id != self.user_id)
             .map(|user| {
                 let style = if Some(user.user_id) == self.selected_private_user {
                     Style::default().bg(Color::Magenta).fg(Color::White).add_modifier(Modifier::BOLD)
@@ -1048,7 +1043,6 @@ impl TuiChatClient {
             .block(Block::default().borders(Borders::ALL).title("Users"));
         f.render_widget(user_list, chunks[0]);
 
-        // Right side - message area
         if let Some(selected_user) = self.selected_private_user {
             if let Some(messages) = self.private_conversations.get(&selected_user) {
                 let message_items: Vec<ListItem> = messages.iter()

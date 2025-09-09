@@ -125,7 +125,7 @@ pub struct UserStatus {
     pub user_id: u16,
     pub username: String,
     pub is_online: bool,
-    pub last_seen: String, // formatted timestamp
+    pub last_seen: String, 
 }
 
 

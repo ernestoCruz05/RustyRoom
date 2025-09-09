@@ -11,7 +11,7 @@
 use crate::resc::{Account, Room, RoomState, RoomInfo};
 use chrono::{DateTime, Utc};
 use serde::{Deserialize, Serialize};
-use sqlx::{Row, SqlitePool};
+use sqlx::{Row, SqlitePool, sqlite::SqlitePoolOptions};
 use std::collections::HashMap;
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -40,28 +40,26 @@ pub struct Database {
 
 impl Database {
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
-        println!("🔌 Attempting database connection: {}", database_url);
+        println!(" Attempting database connection: {}", database_url);
         
-        let pool = match SqlitePool::connect(database_url).await {
-            Ok(pool) => {
-                println!("Database pool created successfully");
-                pool
-            }
-            Err(e) => {
+        let pool = SqlitePoolOptions::new()
+            .max_connections(100)
+            .connect(database_url)
+            .await
+            .map_err(|e| {
                 eprintln!("Failed to create database pool: {}", e);
                 eprintln!("   Database URL: {}", database_url);
                 
-                // Provide helpful hints based on error type
                 if database_url.contains("sqlite:") && !database_url.contains(":memory:") {
                     let file_path = database_url.strip_prefix("sqlite:").unwrap_or(database_url);
                     eprintln!("   File path: {}", file_path);
                     eprintln!("   Hint: Check if the directory exists and is writable");
                     eprintln!("   Try: touch {} && chmod 666 {}", file_path, file_path);
                 }
-                
-                return Err(e);
-            }
-        };
+                e
+            })?;
+        
+        println!("Database pool created successfully with {} connections", pool.size());
         
         let db = Database { pool };
         
@@ -147,7 +145,6 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // User sessions table (for tracking online status)
         sqlx::query(
             r#"
             CREATE TABLE IF NOT EXISTS user_sessions (
@@ -165,7 +162,6 @@ impl Database {
         Ok(())
     }
 
-    // User management
     pub async fn create_user(&self, username: &str, password_hash: &str) -> Result<u16, sqlx::Error> {
         let result = sqlx::query(
             "INSERT INTO users (username, password_hash) VALUES (?, ?) RETURNING id"
@@ -230,7 +226,6 @@ impl Database {
         .execute(&self.pool)
         .await?;
 
-        // Also update the users table
         sqlx::query(
             "UPDATE users SET is_online = ?, last_seen = CURRENT_TIMESTAMP WHERE id = ?"
         )
@@ -267,7 +262,6 @@ impl Database {
         Ok(users)
     }
 
-    // Room management
     pub async fn create_room(&self, id: u16, name: &str, description: &str, state: &RoomState, password_hash: Option<&str>, created_by: u16) -> Result<(), sqlx::Error> {
         let state_str = match state {
             RoomState::Open => "Open",
@@ -284,6 +278,21 @@ impl Database {
         .bind(state_str)
         .bind(password_hash)
         .bind(created_by as i64)
+        .execute(&self.pool)
+        .await?;
+
+        Ok(())
+    }
+
+    pub async fn create_system_room(&self, id: u16, name: &str, description: &str) -> Result<(), sqlx::Error> {
+        sqlx::query(
+            "INSERT INTO rooms (id, name, description, state, password_hash, created_by) VALUES (?, ?, ?, ?, ?, NULL)"
+        )
+        .bind(id as i64)
+        .bind(name)
+        .bind(description)
+        .bind("Open")
+        .bind(None::<String>)
         .execute(&self.pool)
         .await?;
 
@@ -433,7 +442,6 @@ impl Database {
         Ok(members)
     }
 
-    // Message management
     pub async fn save_message(&self, room_id: u16, sender_id: u16, sender_username: &str, content: &str, message_type: &str) -> Result<i64, sqlx::Error> {
         let result = sqlx::query(
             "INSERT INTO messages (room_id, sender_id, sender_username, content, message_type) VALUES (?, ?, ?, ?, ?) RETURNING id"
@@ -477,7 +485,6 @@ impl Database {
             });
         }
 
-        // Reverse to get chronological order
         messages.reverse();
         Ok(messages)
     }
@@ -486,14 +493,25 @@ impl Database {
         self.get_room_messages(room_id, 50).await
     }
 
-    // Cleanup and maintenance
     pub async fn cleanup_old_sessions(&self) -> Result<(), sqlx::Error> {
-        // Mark users as offline if they haven't been active for more than 5 minutes
         sqlx::query(
             r#"
             UPDATE user_sessions 
             SET is_online = FALSE 
-            WHERE last_activity < datetime('now', '-5 minutes')
+            WHERE last_activity < datetime('now', '-1 minutes') AND is_online = TRUE
+            "#
+        )
+        .execute(&self.pool)
+        .await?;
+
+        sqlx::query(
+            r#"
+            UPDATE users 
+            SET is_online = FALSE, last_seen = CURRENT_TIMESTAMP
+            WHERE id IN (
+                SELECT user_id FROM user_sessions 
+                WHERE last_activity < datetime('now', '-1 minutes') AND is_online = FALSE
+            )
             "#
         )
         .execute(&self.pool)
