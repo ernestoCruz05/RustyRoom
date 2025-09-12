@@ -280,8 +280,9 @@ impl TuiChatClient {
         let (ui_tx, ui_rx) = mpsc::unbounded_channel();
         self.ui_receiver = Some(ui_rx);
 
+        let username = self.auth_username.clone();
         thread::spawn(move || {
-            Self::message_receiver(read_stream, ui_tx);
+            Self::message_receiver(read_stream, ui_tx, username);
         });
 
         tokio::spawn(async move {
@@ -302,18 +303,18 @@ impl TuiChatClient {
         Ok(())
     }
 
-    fn message_receiver(stream: TcpStream, ui_sender: mpsc::UnboundedSender<UIUpdate>) {
+    fn message_receiver(stream: TcpStream, ui_sender: mpsc::UnboundedSender<UIUpdate>, username: String) {
         let reader = BufReader::new(stream);
         for line in reader.lines() {
             match line {
                 Ok(json_message) => {
                     if let Ok(message) = Message::from_json_file(&json_message) {
                         match &message.message_type {
-                            MessageType::AuthSuccess { user_id, message: msg } => {
-                                println!("Authentication successful! Message: {}", msg);
+                            MessageType::AuthSuccess { user_id, message: _ } => {
+                                println!("Authentication successful!");
                                 let _ = ui_sender.send(UIUpdate::AuthSuccess { 
                                     user_id: *user_id, 
-                                    username: msg.clone() 
+                                    username: username.clone() 
                                 });
                             }
                             MessageType::AuthFailure { reason } => {

@@ -101,6 +101,7 @@ impl Database {
                 description TEXT NOT NULL,
                 state TEXT NOT NULL DEFAULT 'Open',
                 password_hash TEXT,
+                user_count INTEGER NOT NULL DEFAULT 0,
                 created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
                 created_by INTEGER,
                 FOREIGN KEY (created_by) REFERENCES users (id)
@@ -576,5 +577,21 @@ impl Database {
         }
 
         Ok(rooms)
+    }
+
+    pub async fn increment_room_user_count(&self, room_id: u16) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE rooms SET user_count = user_count + 1 WHERE id = ?")
+            .bind(room_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    pub async fn decrement_room_user_count(&self, room_id: u16) -> Result<(), sqlx::Error> {
+        sqlx::query("UPDATE rooms SET user_count = user_count - 1 WHERE id = ? AND user_count > 0")
+            .bind(room_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
     }
 }

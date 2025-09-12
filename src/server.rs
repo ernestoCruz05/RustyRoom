@@ -63,7 +63,7 @@ impl AsyncChatServer {
         
         let server_cleanup = Arc::clone(&server);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15)); // Check every 15 seconds
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15)); 
             loop {
                 interval.tick().await;
                 
@@ -186,16 +186,14 @@ impl AsyncChatServer {
         }
 
         if let Some(user_id) = connected_user_id {
-            let mut user_senders = self.user_senders.write().await;
-            user_senders.remove(&user_id);
-            drop(user_senders); 
-
             if let Some(account) = self.database.get_user_by_id(user_id).await.unwrap_or(None) {
                 let _ = self.database.set_user_online_status(user_id, &account.username, false).await;
                 println!("User {} ({}) marked as offline", account.username, user_id);
                 
                 let _ = self.broadcast_user_list_update().await;
             }
+            let mut user_senders = self.user_senders.write().await;
+            user_senders.remove(&user_id);
         }
         
         write_task.abort();
@@ -413,6 +411,7 @@ impl AsyncChatServer {
             
             if can_join {
                 self.database.add_user_to_room(user_id, room_id).await?;
+                let _ = self.database.increment_room_user_count(room_id).await;
                 
                 let response = Message::new(0, MessageType::RoomJoined {
                     room_id,
@@ -481,6 +480,8 @@ impl AsyncChatServer {
     async fn handle_leave_room(&self, room_id: u16, user_id: u16, sender: mpsc::UnboundedSender<String>) -> Result<(), Box<dyn std::error::Error>> {
         if let Err(e) = self.database.remove_user_from_room(user_id, room_id).await {
             eprintln!("Failed to remove user {} from room {}: {}", user_id, room_id, e);
+        } else {
+            let _ = self.database.decrement_room_user_count(room_id).await;
         }
         
         let response = Message::new(0, MessageType::ServerResponse {
