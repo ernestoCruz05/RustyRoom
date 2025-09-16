@@ -1,21 +1,31 @@
 [package]
-name = "fca"
+name = "rustyroom_alpha"
 version = "0.1.0"
-edition = "2024"
-authors = ["Ernesto Cruz <a2023144672@isec.pt>"]
-description = "A multi-threaded TCP chat server with room support"
-license = "MIT"
-repository = "https://github.com/ernestoCruz05/fca"
-keywords = ["tcp", "chat", "server", "networking", "rust"]
-categories = ["network-programming"]
+edition = "2021"
 
+[lib]
+name = "rustyroom_alpha"
+path = "src/lib.rs"
+
+[[bin]]
+name = "server"
+path = "src/bin/server.rs"
+
+[[bin]]
+name = "cli_client"
+path = "src/bin/cli_client.rs"
+
+[[bin]]
+name = "tui_client"
+path = "src/bin/tui_client.rs"
 
 [dependencies]
+tokio = { version = "1.37", features = ["full"] }
 serde = { version = "1.0", features = ["derive"] }
 serde_json = "1.0"
 sha2 = "0.10"
-ratatui = "0.28"
-crossterm = "0.28"
-tokio = { version = "1.0", features = ["full"] }
-sqlx = { version = "0.7", features = ["runtime-tokio-rustls", "sqlite", "chrono"] }
-chrono = { version = "0.4", features = ["serde"] }
+chrono = { version = "0.4", features = ["serde", "clock"] }
+sqlx = { version = "0.7", features = ["runtime-tokio", "sqlite", "macros", "chrono"] }
+crossterm = "0.27"
+ratatui = "0.26"
+
