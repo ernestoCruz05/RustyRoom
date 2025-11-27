@@ -1,9 +1,9 @@
 #![allow(dead_code)]
 
-use std::net::SocketAddr;
 use serde::{Deserialize, Serialize};
+use std::net::SocketAddr;
 
-pub struct User{
+pub struct User {
     pub id: u16,
     pub username: String,
     pub hash: String,
@@ -13,7 +13,13 @@ pub struct User{
 }
 
 impl User {
-    pub fn new(id: u16, username: String, hash: String,  address: SocketAddr,  is_auth: bool) -> Self {
+    pub fn new(
+        id: u16,
+        username: String,
+        hash: String,
+        address: SocketAddr,
+        is_auth: bool,
+    ) -> Self {
         User {
             id,
             username,
@@ -38,19 +44,19 @@ impl User {
 }
 
 #[derive(Clone)]
-pub enum RoomState{
+pub enum RoomState {
     Open,
     Private,
     Closed,
 }
 
 #[derive(Clone)]
-pub struct Room{
+pub struct Room {
     pub id: u16,
     pub name: String,
     pub description: String,
     pub state: RoomState,
-    pub password_hash: Option<String>, 
+    pub password_hash: Option<String>,
 }
 
 impl Room {
@@ -64,7 +70,12 @@ impl Room {
         }
     }
 
-    pub fn new_with_password(id: u16, name: String, description: String, password_hash: String) -> Self {
+    pub fn new_with_password(
+        id: u16,
+        name: String,
+        description: String,
+        password_hash: String,
+    ) -> Self {
         Room {
             id,
             name,
@@ -85,31 +96,89 @@ impl Room {
     pub fn verify_password(&self, password_hash: &str) -> bool {
         match &self.password_hash {
             Some(hash) => hash == password_hash,
-            None => true, 
+            None => true,
         }
     }
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub enum MessageType {
-    Register {username: String, password: String},
-    Login {username: String, password: String},
-    AuthSuccess {user_id: u16, message: String},
-    AuthFailure {reason: String},
-    Join {room_id: u16, password: Option<String>},
-    Leave {room_id: u16},
-    CreateRoom {room_id: u16, name: String, description: String, password: Option<String>},
-    RoomCreated {room_id: u16, name: String, description: String},
-    RoomJoined {room_id: u16, name: String, description: String},
-    RoomNotFound {room_id: u16},
-    RoomMessage {room_id: u16, sender_username: String, content: String},
-    PrivateMessage {to_user_id: u16, sender_username: String, content: String},
-    ServerResponse {success: bool, content: String},
+    Register {
+        username: String,
+        password: String,
+    },
+    Login {
+        username: String,
+        password: String,
+    },
+    AuthSuccess {
+        user_id: u16,
+        message: String,
+    },
+    AuthFailure {
+        reason: String,
+    },
+    Join {
+        room_id: u16,
+        password: Option<String>,
+    },
+    Leave {
+        room_id: u16,
+    },
+    // CHANGED: Removed room_id from here
+    CreateRoom {
+        name: String,
+        description: String,
+        password: Option<String>,
+    },
+    RoomCreated {
+        room_id: u16,
+        name: String,
+        description: String,
+    },
+    RoomJoined {
+        room_id: u16,
+        name: String,
+        description: String,
+    },
+    RoomNotFound {
+        room_id: u16,
+    },
+    RoomMessage {
+        room_id: u16,
+        sender_username: String,
+        content: String,
+    },
+    PrivateMessage {
+        to_user_id: u16,
+        sender_username: String,
+        content: String,
+    },
+    ServerResponse {
+        success: bool,
+        content: String,
+    },
     ListRooms,
-    RoomList {rooms: Vec<RoomInfo>},
-    UserStatusUpdate {user_id: u16, username: String, is_online: bool},
-    UserListUpdate {users: Vec<UserStatus>},
+    RoomList {
+        rooms: Vec<RoomInfo>,
+    },
+    UserStatusUpdate {
+        user_id: u16,
+        username: String,
+        is_online: bool,
+    },
+    UserListUpdate {
+        users: Vec<UserStatus>,
+    },
     RequestUserList,
+    RequestVoice,
+    VoiceCredentials {
+        token: String,
+        udp_port: u16,
+    },
+    VoiceError {
+        message: String,
+    },
 }
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
@@ -125,9 +194,8 @@ pub struct UserStatus {
     pub user_id: u16,
     pub username: String,
     pub is_online: bool,
-    pub last_seen: String, 
+    pub last_seen: String,
 }
-
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 pub struct Message {
@@ -143,14 +211,13 @@ impl Message {
         }
     }
 
-    pub fn to_json_file(&self) -> Result<String, serde_json::Error>{
+    pub fn to_json_file(&self) -> Result<String, serde_json::Error> {
         serde_json::to_string(self)
     }
 
     pub fn from_json_file(json: &str) -> Result<Self, serde_json::Error> {
         serde_json::from_str(json)
     }
-
 }
 
 #[derive(Debug, Clone)]
@@ -160,9 +227,9 @@ pub struct Account {
     pub user_id: u16,
 }
 
-impl Account{
+impl Account {
     pub fn new(username: String, hash: String, user_id: u16) -> Self {
-        Account{
+        Account {
             username,
             hash,
             user_id,
@@ -175,7 +242,6 @@ pub enum ChatError {
     Io(std::io::Error),
     Database(sqlx::Error),
     Serialization(serde_json::Error),
-    // ... others
 }
 
 impl From<std::io::Error> for ChatError {

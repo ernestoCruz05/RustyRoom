@@ -1,25 +1,13 @@
-/*
- Rust TCP Client
-
- This is a simple TCP client that connects to a chat server, allowing users to join rooms, send messages, 
- and receive messages from other clients.
-
- Features:
-    # Connect to a chat server.
-    # Join different chat rooms.
-    # Send messages to the room or privately to other clients.
-    # Receive messages from other clients in the room or private messages.
-    # Handle user input and display messages in a user-friendly format.
-
-*/
-
 #![allow(dead_code)]
 
+use crate::audio;
 use crate::resc::{Message, MessageType};
+use ringbuf::traits::*;
 use std::io::{self, BufRead, BufReader, Write};
-use std::net::TcpStream;
-use std::thread;
+use std::net::{TcpStream, UdpSocket};
 use std::sync::{Arc, Mutex};
+use std::thread;
+use std::time::Duration;
 
 #[allow(dead_code)]
 #[derive(Clone)]
@@ -34,7 +22,7 @@ impl ChatClient {
     pub fn new(server_address: String, username: String) -> Self {
         ChatClient {
             server_address,
-            user_id: 0, 
+            user_id: 0,
             username,
             authenticated: false,
         }
@@ -43,7 +31,7 @@ impl ChatClient {
     pub fn connect(&mut self) -> io::Result<()> {
         let stream = TcpStream::connect(&self.server_address)?;
         println!("Connected to server at {}", self.server_address);
-        
+
         let read_stream = stream.try_clone()?;
         let mut write_stream = stream;
 
@@ -63,10 +51,33 @@ impl ChatClient {
 
     fn message_receiver(stream: TcpStream, client: Arc<Mutex<ChatClient>>) {
         let reader = BufReader::new(stream);
+
+        let get_server_ip = |client: &Arc<Mutex<ChatClient>>| -> String {
+            let lock = client.lock().unwrap();
+            let addr = &lock.server_address;
+            addr.split(':').next().unwrap_or("127.0.0.1").to_string()
+        };
+
         for line in reader.lines() {
             match line {
                 Ok(json_message) => {
                     if let Ok(message) = Message::from_json_file(&json_message) {
+                        if let MessageType::VoiceCredentials { token, udp_port } =
+                            &message.message_type
+                        {
+                            println!("[Voice] Received credentials. Connecting...");
+
+                            let server_ip = get_server_ip(&client);
+                            let token_clone = token.clone();
+                            let port_clone = *udp_port;
+
+                            thread::spawn(move || {
+                                Self::start_udp_echo_client(server_ip, port_clone, token_clone);
+                            });
+
+                            continue;
+                        }
+
                         if let MessageType::AuthSuccess { user_id, .. } = &message.message_type {
                             {
                                 let mut client_lock = client.lock().unwrap();
@@ -88,19 +99,102 @@ impl ChatClient {
         }
     }
 
+    fn start_udp_echo_client(server_ip: String, udp_port: u16, token: String) {
+        let (_manager, mut mic_consumer, mut speaker_producer) = match audio::AudioManager::new() {
+            Ok(v) => v,
+            Err(e) => {
+                println!("[VOICE][ERROR] Audio init failed: {}", e);
+                return;
+            }
+        };
+
+        let socket = match UdpSocket::bind("0.0.0.0:0") {
+            Ok(s) => s,
+            Err(e) => {
+                println!("[VOICE][ERROR] UDP bind failed: {}", e);
+                return;
+            }
+        };
+
+        let server_addr = format!("{}:{}", server_ip, udp_port);
+
+        if let Err(e) = socket.send_to(token.as_bytes(), &server_addr) {
+            println!("[VOICE][ERROR] Handshake failed: {}", e);
+            return;
+        }
+
+        let mut buf = [0u8; 4096];
+        let mut audio_chunk = Vec::with_capacity(1024);
+        let _ = socket.set_read_timeout(Some(Duration::from_millis(5)));
+
+        loop {
+            audio_chunk.clear();
+
+            while let Some(sample) = mic_consumer.try_pop() {
+                audio_chunk.push(sample);
+                if audio_chunk.len() >= 256 {
+                    break;
+                }
+            }
+
+            if !audio_chunk.is_empty() {
+                let byte_data: &[u8] = unsafe {
+                    std::slice::from_raw_parts(
+                        audio_chunk.as_ptr() as *const u8,
+                        audio_chunk.len() * 4,
+                    )
+                };
+
+                if let Err(e) = socket.send_to(byte_data, &server_addr) {
+                    eprintln!("Send error: {}", e);
+                }
+            }
+
+            match socket.recv_from(&mut buf) {
+                Ok((size, _src)) => {
+                    if size == 15 && &buf[..15] == b"VOICE_CONNECTED" {
+                        println!("[VOICE] Connected 🟢");
+                        continue;
+                    }
+
+                    let sample_count = size / 4;
+                    let samples: &[f32] = unsafe {
+                        std::slice::from_raw_parts(buf.as_ptr() as *const f32, sample_count)
+                    };
+
+                    for &sample in samples {
+                        let _ = speaker_producer.try_push(sample);
+                    }
+                }
+                Err(_) => {}
+            }
+        }
+    }
+
     fn display_message(message: Message) {
         match message.message_type {
-            MessageType::AuthSuccess { user_id, message: msg } => {
+            MessageType::AuthSuccess {
+                user_id,
+                message: msg,
+            } => {
                 println!("[SUCCESS] {}", msg);
                 println!("Your user ID is: {}", user_id);
             }
             MessageType::AuthFailure { reason } => {
                 println!("[ERROR] {}", reason);
             }
-            MessageType::RoomMessage { room_id, sender_username , content } => {
+            MessageType::RoomMessage {
+                room_id,
+                sender_username,
+                content,
+            } => {
                 println!("[Room {}] {}: {}", room_id, sender_username, content);
             }
-            MessageType::PrivateMessage { to_user_id: _, sender_username,  content } => {
+            MessageType::PrivateMessage {
+                to_user_id: _,
+                sender_username,
+                content,
+            } => {
                 println!("[Private from {}]: {}", sender_username, content);
             }
             MessageType::ServerResponse { success, content } => {
@@ -110,30 +204,49 @@ impl ChatClient {
                     println!("[Server Error]: {}", content);
                 }
             }
-            MessageType::RoomCreated { room_id, name, description } => {
-                println!("[SUCCESS] Room '{}' (ID: {}) created successfully!", name, room_id);
+            MessageType::RoomCreated {
+                room_id,
+                name,
+                description,
+            } => {
+                println!(
+                    "[SUCCESS] Room '{}' (ID: {}) created successfully!",
+                    name, room_id
+                );
                 println!("         Description: {}", description);
             }
-            MessageType::RoomJoined { room_id, name, description } => {
+            MessageType::RoomJoined {
+                room_id,
+                name,
+                description,
+            } => {
                 println!("╔══════════════════════════════════════════════════════════════╗");
                 println!("║ Welcome to '{}' (Room ID: {})!", name, room_id);
                 println!("║");
                 println!("║ About this room:");
                 println!("║    {}", description);
                 println!("║");
-                println!("║ You can now send messages with: /msg {} <your message>", room_id);
+                println!(
+                    "║ You can now send messages with: /msg {} <your message>",
+                    room_id
+                );
                 println!("╚══════════════════════════════════════════════════════════════╝");
             }
             MessageType::RoomNotFound { room_id } => {
                 println!("[INFO] Room {} doesn't exist yet.", room_id);
+                // CHANGED: Instructions update
                 println!("       Would you like to create it? Use:");
-                println!("       /create {} <name> <description> [password]", room_id);
-                println!("       Example: /create {} \"General Chat\" \"A place for general discussion\"", room_id);
+                println!("       /create <name> <description> [password]");
+                println!(
+                    "       Example: /create \"General Chat\" \"A place for general discussion\""
+                );
             }
             MessageType::Register { .. } | MessageType::Login { .. } => {
                 println!("[Debug] Received unexpected auth message");
             }
-            MessageType::Join { .. } | MessageType::Leave { .. } | MessageType::CreateRoom { .. } => {
+            MessageType::Join { .. }
+            | MessageType::Leave { .. }
+            | MessageType::CreateRoom { .. } => {
                 println!("[Debug] Received unexpected room action message");
             }
             MessageType::ListRooms => {
@@ -145,7 +258,11 @@ impl ChatClient {
                     println!("  [{}] {} - {}", room.id, room.name, room.description);
                 }
             }
-            MessageType::UserStatusUpdate { user_id, username, is_online } => {
+            MessageType::UserStatusUpdate {
+                user_id,
+                username,
+                is_online,
+            } => {
                 let status = if is_online { "online" } else { "offline" };
                 println!("User {} ({}) is now {}", username, user_id, status);
             }
@@ -159,23 +276,30 @@ impl ChatClient {
             MessageType::RequestUserList => {
                 println!("[Debug] Received RequestUserList");
             }
+            _ => {
+                println!("[Debug] Received other message type");
+            }
         }
     }
 
-    fn handle_user_input(&mut self, stream: &mut TcpStream, client_clone: Arc<Mutex<ChatClient>>) -> io::Result<()> {
+    fn handle_user_input(
+        &mut self,
+        stream: &mut TcpStream,
+        client_clone: Arc<Mutex<ChatClient>>,
+    ) -> io::Result<()> {
         let stdin = io::stdin();
         for line in stdin.lock().lines() {
             let input = line?;
-            
+
             if input == "/quit" {
                 break;
             }
-            
+
             let is_authenticated = {
                 let client_lock = client_clone.lock().unwrap();
                 client_lock.authenticated
             };
-            
+
             if let Some(message) = self.parse_command(&input, is_authenticated) {
                 let json = message.to_json_file().unwrap();
                 writeln!(stream, "{}", json)?;
@@ -188,7 +312,7 @@ impl ChatClient {
 
     fn parse_command(&self, input: &str, is_authenticated: bool) -> Option<Message> {
         let parts: Vec<&str> = input.split_whitespace().collect();
-        
+
         match parts.get(0)? {
             &"/register" => {
                 if is_authenticated {
@@ -201,7 +325,10 @@ impl ChatClient {
                 }
                 let username = parts[1].to_string();
                 let password = parts[2].to_string();
-                Some(Message::new(0, MessageType::Register { username, password }))
+                Some(Message::new(
+                    0,
+                    MessageType::Register { username, password },
+                ))
             }
             &"/login" => {
                 if is_authenticated {
@@ -231,7 +358,10 @@ impl ChatClient {
                 } else {
                     None
                 };
-                Some(Message::new(self.user_id, MessageType::Join { room_id, password }))
+                Some(Message::new(
+                    self.user_id,
+                    MessageType::Join { room_id, password },
+                ))
             }
             &"/leave" => {
                 if !is_authenticated {
@@ -250,23 +380,33 @@ impl ChatClient {
                     println!("Please login or register first!");
                     return None;
                 }
-                
+
                 let args = Self::parse_quoted_args(input)?;
-                if args.len() < 4 {
-                    println!("Usage: /create <room_id> <name> <description> [password]");
-                    println!("Example: /create 1 \"General Chat\" \"A place for general discussion\" [password]");
+                // CHANGED: Now fewer args required (removed room_id)
+                if args.len() < 3 {
+                    println!("Usage: /create <name> <description> [password]");
+                    println!(
+                        "Example: /create \"General Chat\" \"A place for general discussion\" [password]"
+                    );
                     return None;
                 }
-                
-                let room_id: u16 = args.get(1)?.parse().ok()?;
-                let name = args.get(2)?.clone();
-                let description = args.get(3)?.clone();
-                let password = if args.len() > 4 {
-                    Some(args.get(4)?.clone())
+
+                // Index 1 is name, 2 is description
+                let name = args.get(1)?.clone();
+                let description = args.get(2)?.clone();
+                let password = if args.len() > 3 {
+                    Some(args.get(3)?.clone())
                 } else {
                     None
                 };
-                Some(Message::new(self.user_id, MessageType::CreateRoom { room_id, name, description, password }))
+                Some(Message::new(
+                    self.user_id,
+                    MessageType::CreateRoom {
+                        name,
+                        description,
+                        password,
+                    },
+                ))
             }
             &"/msg" => {
                 if !is_authenticated {
@@ -279,7 +419,14 @@ impl ChatClient {
                 }
                 let room_id: u16 = parts.get(1)?.parse().ok()?;
                 let content = parts[2..].join(" ");
-                Some(Message::new(self.user_id, MessageType::RoomMessage { room_id, sender_username: String::new(), content }))
+                Some(Message::new(
+                    self.user_id,
+                    MessageType::RoomMessage {
+                        room_id,
+                        sender_username: String::new(),
+                        content,
+                    },
+                ))
             }
             &"/private" => {
                 if !is_authenticated {
@@ -292,14 +439,31 @@ impl ChatClient {
                 }
                 let to_user_id: u16 = parts.get(1)?.parse().ok()?;
                 let content = parts[2..].join(" ");
-                Some(Message::new(self.user_id, MessageType::PrivateMessage { to_user_id, sender_username: String::new(),content }))
+                Some(Message::new(
+                    self.user_id,
+                    MessageType::PrivateMessage {
+                        to_user_id,
+                        sender_username: String::new(),
+                        content,
+                    },
+                ))
+            }
+            &"/voice" => {
+                if !is_authenticated {
+                    println!("Please login first!");
+                    return None;
+                }
+                println!("[Command] Requesting voice connection...");
+                Some(Message::new(self.user_id, MessageType::RequestVoice))
             }
             _ => {
                 println!("Unknown command: {}", input);
                 if !is_authenticated {
                     println!("Available commands: /register, /login, /quit");
                 } else {
-                    println!("Available commands: /join, /leave, /create, /msg, /private, /quit");
+                    println!(
+                        "Available commands: /join, /leave, /create, /msg, /private, /voice, /quit"
+                    );
                 }
                 None
             }
@@ -311,7 +475,7 @@ impl ChatClient {
         let mut current_arg = String::new();
         let mut in_quotes = false;
         let mut chars = input.chars().peekable();
-        
+
         while let Some(ch) = chars.next() {
             match ch {
                 '"' => {
@@ -328,16 +492,12 @@ impl ChatClient {
                 }
             }
         }
-        
+
         if !current_arg.is_empty() {
             args.push(current_arg.trim().to_string());
         }
-        
-        if args.is_empty() {
-            None
-        } else {
-            Some(args)
-        }
+
+        if args.is_empty() { None } else { Some(args) }
     }
 
     fn show_auth_commands() {
@@ -353,16 +513,20 @@ impl ChatClient {
         println!("\n=== Successfully Authenticated! ===");
         println!("Chat Commands:");
         println!("  /join <room_id> [password] - Join a room (use password if room is private)");
-        println!("  /leave <room_id> - Leave a room"); 
-        println!("  /create <room_id> <name> <description> [password] - Create a new room");
+        println!("  /leave <room_id> - Leave a room");
+        println!("  /create <name> <description> [password] - Create a new room");
         println!("  /msg <room_id> <message> - Send message to room");
         println!("  /private <user_id> <message> - Send private message");
+        println!("  /voice - Start voice chat (Experimental)");
         println!("  /quit - Disconnect");
         println!();
         println!("   Tips:");
-        println!("   • When you try to join a non-existent room, you'll be prompted to create it");
-        println!("   • Use quotes for multi-word names: /create 1 \"My Room\" \"A cool place to chat\"");
-        println!("   • Add a password to make your room private: /create 1 \"Secret\" \"Private room\" mypassword");
+        println!(
+            "   • Use quotes for multi-word names: /create \"My Room\" \"A cool place to chat\""
+        );
+        println!(
+            "   • Add a password to make your room private: /create \"Secret\" \"Private room\" mypassword"
+        );
         println!();
     }
 
