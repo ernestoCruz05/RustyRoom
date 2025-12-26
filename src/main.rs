@@ -4,6 +4,7 @@ mod database;
 mod resc;
 mod server;
 mod tui_client;
+mod voice;
 
 use client::ChatClient;
 use server::AsyncChatServer;

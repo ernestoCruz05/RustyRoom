@@ -1,8 +1,13 @@
-/*
- TUI Chat Client for FCA
-*/
+//! TUI Chat Client for RustyRoom
+//!
+//! This module provides a terminal-based user interface for the chat application
+//! using the `ratatui` library. It supports real-time messaging, room management,
+//! voice chat with configurable audio devices, private messaging, and user presence.
+//!
+//! The client runs in a terminal alternate screen and handles keyboard input
+//! for navigation, text entry, and command execution.
 
-use crate::audio;
+use crate::audio::{self, AudioDeviceInfo};
 use crate::resc::{Message, MessageType, RoomInfo, UserStatus};
 use crossterm::{
     event::{self, DisableMouseCapture, EnableMouseCapture, Event, KeyCode, KeyEventKind},
@@ -15,21 +20,73 @@ use ratatui::{
     layout::{Alignment, Constraint, Direction, Layout, Rect},
     style::{Color, Modifier, Style},
     text::{Line, Span},
-    widgets::{Block, Borders, Clear, List, ListItem, Paragraph, Tabs, Wrap},
+    widgets::{Block, Borders, Clear, List, ListItem, ListState, Paragraph, Tabs, Wrap, Gauge},
 };
 use ringbuf::traits::*;
 use std::{
     collections::HashMap,
     io::{self, BufRead, BufReader, Write},
     net::{TcpStream, UdpSocket},
+    sync::atomic::{AtomicBool, Ordering},
+    sync::Arc,
     thread,
     time::{Duration, Instant},
 };
 use tokio::sync::mpsc;
 
+/// Types of toast notifications displayed in the UI.
+///
+/// Used to style notifications with appropriate colors and icons.
+#[derive(Debug, Clone)]
+pub enum NotificationType {
+    /// Operation completed successfully (green)
+    Success,
+    /// Informational message (blue)
+    Info,
+    /// Warning that requires attention (yellow)
+    Warning,
+    /// Error or failure (red)
+    Error,
+}
+
+/// A toast notification displayed temporarily in the UI.
+///
+/// Notifications appear at the top of the screen and automatically
+/// disappear after their duration expires.
+#[derive(Debug, Clone)]
+pub struct Notification {
+    /// The notification message text
+    pub message: String,
+    /// The type/severity of the notification
+    pub notification_type: NotificationType,
+    /// When the notification was created
+    pub created_at: Instant,
+    /// How long the notification should be displayed
+    pub duration: Duration,
+}
+
+impl Notification {
+    pub fn new(message: String, notification_type: NotificationType) -> Self {
+        Self {
+            message,
+            notification_type,
+            created_at: Instant::now(),
+            duration: Duration::from_secs(3),
+        }
+    }
+
+    pub fn is_expired(&self) -> bool {
+        self.created_at.elapsed() > self.duration
+    }
+}
+
+/// UI state update messages received from background threads.
+///
+/// These messages are sent from the network receiver thread to update
+/// the UI state in response to server events.
 #[derive(Debug, Clone)]
 pub enum UIUpdate {
-    // CHANGED: Removed 'username' from here, we will use the local state instead
+    /// Authentication was successful
     AuthSuccess {
         user_id: u16,
     },
@@ -70,75 +127,174 @@ pub enum UIUpdate {
         connected: bool,
         message: String,
     },
+    VoiceLevel {
+        level: f32,
+    },
 }
 
+/// Types of chat messages for styling and display purposes.
 #[derive(Debug, Clone)]
 pub enum ChatMessageType {
+    /// Regular message from a user
     User,
+    /// System notification or status message
     System,
+    /// Private/direct message
     Private,
+    /// Error message
     Error,
 }
 
+/// A single chat message displayed in the message list.
 #[derive(Debug, Clone)]
 pub struct ChatMessage {
+    /// Formatted timestamp string (HH:MM:SS)
     pub timestamp: String,
+    /// Username of the message sender
     pub sender: String,
+    /// The message content
     pub content: String,
+    /// Type of message for styling
     pub message_type: ChatMessageType,
 }
 
+/// A chat room with its messages and metadata.
 #[derive(Debug, Clone)]
 pub struct Room {
+    /// Unique room identifier
     pub id: u16,
+    /// Display name of the room
     pub name: String,
+    /// Room description
     pub description: String,
+    /// Number of users currently in the room
     pub user_count: u16,
+    /// Message history for this room
     pub messages: Vec<ChatMessage>,
 }
 
+/// Tab selection for the settings screen.
+#[derive(Debug, Clone, PartialEq)]
+enum SettingsTab {
+    /// Audio device configuration (input/output devices, volumes)
+    Audio,
+    /// Voice chat settings
+    Voice,
+    /// UI appearance and behavior settings
+    Interface,
+}
+
+/// Audio device configuration and volume settings.
+///
+/// Stores the list of available audio devices and the user's
+/// selected input/output devices along with volume levels.
+#[derive(Debug)]
+struct AudioSettings {
+    /// Available audio input (microphone) devices
+    input_devices: Vec<AudioDeviceInfo>,
+    /// Available audio output (speaker) devices
+    output_devices: Vec<AudioDeviceInfo>,
+    /// Index of the selected input device
+    selected_input_index: usize,
+    /// Index of the selected output device
+    selected_output_index: usize,
+    /// Input volume level (0-100)
+    input_volume: u8,
+    /// Output volume level (0-100)
+    output_volume: u8,
+}
+
+impl Default for AudioSettings {
+    fn default() -> Self {
+        Self {
+            input_devices: Vec::new(),
+            output_devices: Vec::new(),
+            selected_input_index: 0,
+            selected_output_index: 0,
+            input_volume: 100,
+            output_volume: 100,
+        }
+    }
+}
+
+/// The main TUI chat client application.
+///
+/// Manages all client state including authentication, room membership,
+/// message history, voice chat, and UI components. The client connects
+/// to the server over TCP and handles real-time message updates.
 #[derive(Debug)]
 pub struct TuiChatClient {
     server_address: String,
 
+    // Authentication state
     authenticated: bool,
     user_id: u16,
     username: String,
 
+    // Chat state
     input: String,
     current_room: Option<u16>,
     rooms: HashMap<u16, Room>,
     joined_rooms: Vec<u16>,
 
+    // UI state
     show_help: bool,
     show_room_browser: bool,
     show_settings: bool,
     show_private_messages: bool,
     cursor_position: usize,
 
+    // Room browser state
     available_rooms: Vec<RoomInfo>,
     selected_room_index: usize,
+    
+    // Private messages state
     private_conversations: HashMap<u16, Vec<ChatMessage>>,
     selected_private_user: Option<u16>,
     selected_user_index: usize,
 
+    // Auth form state
     auth_mode: AuthMode,
     auth_username: String,
     auth_password: String,
     auth_field: AuthField,
     auth_error: Option<String>,
 
+    // Network state
     message_sender: Option<mpsc::UnboundedSender<Message>>,
     ui_receiver: Option<mpsc::UnboundedReceiver<UIUpdate>>,
     online_users: Vec<UserStatus>,
+    
+    // Cursor animation
     cursor_visible: bool,
     last_cursor_toggle: Instant,
+    
+    // Voice state
     voice_connected: bool,
+    voice_muted: bool,
+    voice_deafened: bool,
+    voice_level: f32,
+    voice_stop_signal: Option<Arc<AtomicBool>>,
+    
+    // Audio settings
+    audio_settings: AudioSettings,
+    settings_tab: SettingsTab,
+    settings_field: usize,
+    
+    // Notifications
+    notifications: Vec<Notification>,
+    
+    // Message scroll state
+    message_scroll_offset: usize,
+    messages_list_state: ListState,
 }
 
+/// Authentication screen mode selection.
 #[derive(Debug, Clone, PartialEq)]
 enum AuthMode {
+    /// Login with existing credentials
     Login,
+    /// Register a new account
     Register,
 }
 
@@ -149,7 +305,28 @@ enum AuthField {
 }
 
 impl TuiChatClient {
+    /// Creates a new TUI client instance.
+    ///
+    /// Initializes the client with the given server address and loads
+    /// available audio devices. Does not connect to the server yet.
     pub fn new(server_address: String) -> Self {
+        // Suppress ALSA error messages on Linux (they're noisy but harmless)
+        audio::suppress_alsa_errors();
+        
+        // Load audio devices on startup
+        let input_devices = audio::list_input_devices();
+        let output_devices = audio::list_output_devices();
+        
+        // Find default device indices
+        let selected_input_index = input_devices
+            .iter()
+            .position(|d| d.is_default)
+            .unwrap_or(0);
+        let selected_output_index = output_devices
+            .iter()
+            .position(|d| d.is_default)
+            .unwrap_or(0);
+        
         Self {
             server_address,
             authenticated: false,
@@ -180,9 +357,69 @@ impl TuiChatClient {
             selected_private_user: None,
             selected_user_index: 0,
             voice_connected: false,
+            voice_muted: false,
+            voice_deafened: false,
+            voice_level: 0.0,
+            voice_stop_signal: None,
+            audio_settings: AudioSettings {
+                input_devices,
+                output_devices,
+                selected_input_index,
+                selected_output_index,
+                input_volume: 100,
+                output_volume: 100,
+            },
+            settings_tab: SettingsTab::Audio,
+            settings_field: 0,
+            notifications: Vec::new(),
+            message_scroll_offset: 0,
+            messages_list_state: ListState::default(),
         }
     }
+    
+    /// Add a notification toast
+    fn add_notification(&mut self, message: String, notification_type: NotificationType) {
+        self.notifications.push(Notification::new(message, notification_type));
+        // Keep only last 5 notifications
+        if self.notifications.len() > 5 {
+            self.notifications.remove(0);
+        }
+    }
+    
+    /// Refresh audio device list
+    fn refresh_audio_devices(&mut self) {
+        self.audio_settings.input_devices = audio::list_input_devices();
+        self.audio_settings.output_devices = audio::list_output_devices();
+        
+        // Clamp indices
+        if self.audio_settings.selected_input_index >= self.audio_settings.input_devices.len() {
+            self.audio_settings.selected_input_index = 0;
+        }
+        if self.audio_settings.selected_output_index >= self.audio_settings.output_devices.len() {
+            self.audio_settings.selected_output_index = 0;
+        }
+    }
+    
+    /// Get selected input device name
+    fn selected_input_device(&self) -> Option<&str> {
+        self.audio_settings
+            .input_devices
+            .get(self.audio_settings.selected_input_index)
+            .map(|d| d.name.as_str())
+    }
+    
+    /// Get selected output device name  
+    fn selected_output_device(&self) -> Option<&str> {
+        self.audio_settings
+            .output_devices
+            .get(self.audio_settings.selected_output_index)
+            .map(|d| d.name.as_str())
+    }
 
+    /// Starts the TUI application.
+    ///
+    /// Sets up the terminal in raw mode, creates the client instance,
+    /// and runs the main event loop. Restores terminal state on exit.
     pub async fn start_tui(server_address: &str) -> io::Result<()> {
         enable_raw_mode()?;
         let mut stdout = io::stdout();
@@ -204,6 +441,10 @@ impl TuiChatClient {
         result
     }
 
+    /// Main event loop that processes input and updates the UI.
+    ///
+    /// Connects to the server, then continuously polls for keyboard events
+    /// and UI updates from background threads. Redraws the screen each tick.
     async fn run(
         &mut self,
         terminal: &mut Terminal<CrosstermBackend<io::Stdout>>,
@@ -211,7 +452,9 @@ impl TuiChatClient {
         self.connect().await?;
 
         let mut last_tick = Instant::now();
+        let mut last_refresh = Instant::now();
         let tick_rate = Duration::from_millis(50);
+        let refresh_rate = Duration::from_secs(10); // Refresh user list every 10 seconds
 
         loop {
             if let Some(ui_receiver) = &mut self.ui_receiver {
@@ -304,22 +547,37 @@ impl TuiChatClient {
                             }
                         }
                         UIUpdate::VoiceStatus { connected, message } => {
+                            let was_connected = self.voice_connected;
                             self.voice_connected = connected;
+                            
+                            // Add notification
+                            if connected && !was_connected {
+                                self.add_notification("Voice connected!".to_string(), NotificationType::Success);
+                            } else if !connected && was_connected {
+                                self.add_notification("Voice disconnected".to_string(), NotificationType::Info);
+                            }
+                            
                             if let Some(room_id) = self.current_room {
                                 if let Some(room) = self.rooms.get_mut(&room_id) {
                                     room.messages.push(ChatMessage {
                                         timestamp: Self::current_time(),
-                                        sender: "Voice".to_string(),
+                                        sender: "[Voice]".to_string(),
                                         content: message,
                                         message_type: ChatMessageType::System,
                                     });
                                 }
                             }
                         }
+                        UIUpdate::VoiceLevel { level } => {
+                            self.voice_level = level;
+                        }
                         _ => {}
                     }
                 }
             }
+            
+            // Clean up expired notifications
+            self.notifications.retain(|n| !n.is_expired());
 
             terminal.draw(|f| self.draw(f))?;
 
@@ -345,13 +603,33 @@ impl TuiChatClient {
             if last_tick.elapsed() >= tick_rate {
                 last_tick = Instant::now();
             }
+            
+            // Periodically refresh the user list to keep it current
+            if self.authenticated && last_refresh.elapsed() >= refresh_rate {
+                if let Some(sender) = &self.message_sender {
+                    let _ = sender.send(Message::new(self.user_id, MessageType::RequestUserList));
+                }
+                last_refresh = Instant::now();
+            }
         }
 
         Ok(())
     }
 
+    /// Establishes TCP connection to the server.
+    ///
+    /// Creates reader and writer threads for message handling and
+    /// sets up channels for UI updates.
     async fn connect(&mut self) -> io::Result<()> {
         let stream = TcpStream::connect(&self.server_address)?;
+        
+        // Set TCP_NODELAY for lower latency
+        let _ = stream.set_nodelay(true);
+        
+        // Set read timeout to detect dead connections
+        // If no data for 60 seconds, the read will fail and trigger reconnection
+        let _ = stream.set_read_timeout(Some(Duration::from_secs(120)));
+        
         let read_stream = stream.try_clone()?;
         let write_stream = stream.try_clone()?;
 
@@ -604,6 +882,10 @@ impl TuiChatClient {
         format!("{:02}:{:02}", hours, minutes)
     }
 
+    /// Handles keyboard input and dispatches to appropriate handlers.
+    ///
+    /// Returns `true` if the application should exit, `false` otherwise.
+    /// Delegates to auth screen handler when not authenticated.
     async fn handle_key_event(&mut self, key: KeyCode) -> io::Result<bool> {
         if !self.authenticated {
             return Ok(self.handle_auth_key_event(key).await?);
@@ -640,20 +922,50 @@ impl TuiChatClient {
                     self.update_selected_private_user();
                 }
             }
-            KeyCode::F(4) => self.show_settings = !self.show_settings,
+            KeyCode::F(4) => {
+                self.show_settings = !self.show_settings;
+                if self.show_settings {
+                    self.refresh_audio_devices();
+                    self.settings_field = 0;
+                }
+            }
             KeyCode::F(5) => {
                 if self.voice_connected {
-                    if let Some(ui_receiver) = &mut self.ui_receiver {
-                        self.voice_connected = false;
+                    // Stop voice
+                    if let Some(stop_signal) = &self.voice_stop_signal {
+                        stop_signal.store(true, Ordering::Relaxed);
                     }
+                    self.voice_connected = false;
+                    self.voice_stop_signal = None;
+                    self.add_notification("Voice disconnected".to_string(), NotificationType::Info);
                 } else {
+                    // Start voice
                     if let Some(sender) = &self.message_sender {
                         let _ = sender.send(Message::new(self.user_id, MessageType::RequestVoice));
                     }
                 }
             }
+            // Voice mute toggle (Ctrl+M or when voice is connected and not in input mode)
+            KeyCode::F(6) => {
+                if self.voice_connected {
+                    self.voice_muted = !self.voice_muted;
+                    let status = if self.voice_muted { "Microphone muted" } else { "Microphone unmuted" };
+                    self.add_notification(status.to_string(), NotificationType::Info);
+                }
+            }
+            // Voice deafen toggle
+            KeyCode::F(7) => {
+                if self.voice_connected {
+                    self.voice_deafened = !self.voice_deafened;
+                    let status = if self.voice_deafened { "Audio deafened" } else { "Audio undeafened" };
+                    self.add_notification(status.to_string(), NotificationType::Info);
+                }
+            }
             KeyCode::Enter => {
-                if self.show_room_browser {
+                if self.show_settings {
+                    // Handle settings selection
+                    self.handle_settings_enter();
+                } else if self.show_room_browser {
                     if !self.available_rooms.is_empty()
                         && self.selected_room_index < self.available_rooms.len()
                     {
@@ -699,7 +1011,9 @@ impl TuiChatClient {
                 }
             }
             KeyCode::Left => {
-                if self.show_room_browser {
+                if self.show_settings {
+                    self.handle_settings_left();
+                } else if self.show_room_browser {
                     if self.selected_room_index > 0 {
                         self.selected_room_index -= 1;
                     }
@@ -708,7 +1022,9 @@ impl TuiChatClient {
                 }
             }
             KeyCode::Right => {
-                if self.show_room_browser {
+                if self.show_settings {
+                    self.handle_settings_right();
+                } else if self.show_room_browser {
                     if self.selected_room_index < self.available_rooms.len().saturating_sub(1) {
                         self.selected_room_index += 1;
                     }
@@ -717,7 +1033,11 @@ impl TuiChatClient {
                 }
             }
             KeyCode::Up => {
-                if self.show_room_browser {
+                if self.show_settings {
+                    if self.settings_field > 0 {
+                        self.settings_field -= 1;
+                    }
+                } else if self.show_room_browser {
                     if self.selected_room_index > 0 {
                         self.selected_room_index -= 1;
                     }
@@ -726,10 +1046,24 @@ impl TuiChatClient {
                         self.selected_user_index -= 1;
                         self.update_selected_private_user();
                     }
+                } else {
+                    // Scroll messages up
+                    self.message_scroll_offset = self.message_scroll_offset.saturating_add(1);
                 }
             }
             KeyCode::Down => {
-                if self.show_room_browser {
+                if self.show_settings {
+                    self.settings_field += 1;
+                    // Clamp based on current tab
+                    let max_field = match self.settings_tab {
+                        SettingsTab::Audio => 3,  // input device, output device, input vol, output vol
+                        SettingsTab::Voice => 2,  // push-to-talk, vad threshold
+                        SettingsTab::Interface => 1,
+                    };
+                    if self.settings_field > max_field {
+                        self.settings_field = max_field;
+                    }
+                } else if self.show_room_browser {
                     if self.selected_room_index < self.available_rooms.len().saturating_sub(1) {
                         self.selected_room_index += 1;
                     }
@@ -743,10 +1077,35 @@ impl TuiChatClient {
                         self.selected_user_index += 1;
                         self.update_selected_private_user();
                     }
+                } else {
+                    // Scroll messages down
+                    self.message_scroll_offset = self.message_scroll_offset.saturating_sub(1);
                 }
             }
+            KeyCode::PageUp => {
+                self.message_scroll_offset = self.message_scroll_offset.saturating_add(10);
+            }
+            KeyCode::PageDown => {
+                self.message_scroll_offset = self.message_scroll_offset.saturating_sub(10);
+            }
+            KeyCode::Home => {
+                self.cursor_position = 0;
+            }
+            KeyCode::End => {
+                self.cursor_position = self.input.len();
+            }
             KeyCode::Tab => {
-                self.switch_room();
+                if self.show_settings {
+                    // Cycle through settings tabs
+                    self.settings_tab = match self.settings_tab {
+                        SettingsTab::Audio => SettingsTab::Voice,
+                        SettingsTab::Voice => SettingsTab::Interface,
+                        SettingsTab::Interface => SettingsTab::Audio,
+                    };
+                    self.settings_field = 0;
+                } else {
+                    self.switch_room();
+                }
             }
             KeyCode::Char(c) => {
                 self.input.insert(self.cursor_position, c);
@@ -755,6 +1114,130 @@ impl TuiChatClient {
             _ => {}
         }
         Ok(false)
+    }
+    
+    /// Handle settings field selection with Enter
+    fn handle_settings_enter(&mut self) {
+        match self.settings_tab {
+            SettingsTab::Audio => {
+                // Cycle through devices or toggle
+                match self.settings_field {
+                    0 => {
+                        // Input device - cycle to next
+                        if !self.audio_settings.input_devices.is_empty() {
+                            self.audio_settings.selected_input_index = 
+                                (self.audio_settings.selected_input_index + 1) 
+                                % self.audio_settings.input_devices.len();
+                            if let Some(name) = self.selected_input_device() {
+                                self.add_notification(
+                                    format!("Input: {}", name), 
+                                    NotificationType::Info
+                                );
+                            }
+                        }
+                    }
+                    1 => {
+                        // Output device - cycle to next
+                        if !self.audio_settings.output_devices.is_empty() {
+                            self.audio_settings.selected_output_index = 
+                                (self.audio_settings.selected_output_index + 1) 
+                                % self.audio_settings.output_devices.len();
+                            if let Some(name) = self.selected_output_device() {
+                                self.add_notification(
+                                    format!("Output: {}", name), 
+                                    NotificationType::Info
+                                );
+                            }
+                        }
+                    }
+                    _ => {}
+                }
+            }
+            SettingsTab::Voice => {}
+            SettingsTab::Interface => {}
+        }
+    }
+    
+    /// Handle left arrow in settings (decrease values)
+    fn handle_settings_left(&mut self) {
+        match self.settings_tab {
+            SettingsTab::Audio => {
+                match self.settings_field {
+                    0 => {
+                        // Previous input device
+                        if !self.audio_settings.input_devices.is_empty() {
+                            if self.audio_settings.selected_input_index > 0 {
+                                self.audio_settings.selected_input_index -= 1;
+                            } else {
+                                self.audio_settings.selected_input_index = 
+                                    self.audio_settings.input_devices.len() - 1;
+                            }
+                        }
+                    }
+                    1 => {
+                        // Previous output device
+                        if !self.audio_settings.output_devices.is_empty() {
+                            if self.audio_settings.selected_output_index > 0 {
+                                self.audio_settings.selected_output_index -= 1;
+                            } else {
+                                self.audio_settings.selected_output_index = 
+                                    self.audio_settings.output_devices.len() - 1;
+                            }
+                        }
+                    }
+                    2 => {
+                        // Decrease input volume
+                        self.audio_settings.input_volume = 
+                            self.audio_settings.input_volume.saturating_sub(5);
+                    }
+                    3 => {
+                        // Decrease output volume
+                        self.audio_settings.output_volume = 
+                            self.audio_settings.output_volume.saturating_sub(5);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
+    }
+    
+    /// Handle right arrow in settings (increase values)
+    fn handle_settings_right(&mut self) {
+        match self.settings_tab {
+            SettingsTab::Audio => {
+                match self.settings_field {
+                    0 => {
+                        // Next input device
+                        if !self.audio_settings.input_devices.is_empty() {
+                            self.audio_settings.selected_input_index = 
+                                (self.audio_settings.selected_input_index + 1) 
+                                % self.audio_settings.input_devices.len();
+                        }
+                    }
+                    1 => {
+                        // Next output device
+                        if !self.audio_settings.output_devices.is_empty() {
+                            self.audio_settings.selected_output_index = 
+                                (self.audio_settings.selected_output_index + 1) 
+                                % self.audio_settings.output_devices.len();
+                        }
+                    }
+                    2 => {
+                        // Increase input volume
+                        self.audio_settings.input_volume = 
+                            (self.audio_settings.input_volume + 5).min(100);
+                    }
+                    3 => {
+                        // Increase output volume
+                        self.audio_settings.output_volume = 
+                            (self.audio_settings.output_volume + 5).min(100);
+                    }
+                    _ => {}
+                }
+            }
+            _ => {}
+        }
     }
 
     async fn handle_auth_key_event(&mut self, key: KeyCode) -> io::Result<bool> {
@@ -946,6 +1429,10 @@ impl TuiChatClient {
         }
     }
 
+    /// Renders the UI to the terminal frame.
+    ///
+    /// Displays either the authentication screen or the main chat interface
+    /// depending on the current authentication state.
     fn draw(&self, f: &mut Frame) {
         if !self.authenticated {
             self.draw_auth_screen(f);
@@ -1049,13 +1536,19 @@ impl TuiChatClient {
         let left_chunks = Layout::default()
             .direction(Direction::Vertical)
             .constraints([
-                Constraint::Length(3),
-                Constraint::Length(3),
-                Constraint::Min(1),
-                Constraint::Length(3),
-                Constraint::Length(1),
+                Constraint::Length(3),  // Header with voice indicator
+                Constraint::Length(3),  // Room tabs
+                Constraint::Min(1),     // Chat area
+                Constraint::Length(3),  // Input
+                Constraint::Length(2),  // Status bar
             ])
             .split(main_chunks[0]);
+
+        // Header with username and voice status
+        let header_chunks = Layout::default()
+            .direction(Direction::Horizontal)
+            .constraints([Constraint::Min(20), Constraint::Length(15)])
+            .split(left_chunks[0]);
 
         let header = Paragraph::new(format!("FCA - Connected as: {}", self.username))
             .style(
@@ -1064,8 +1557,31 @@ impl TuiChatClient {
                     .add_modifier(Modifier::BOLD),
             )
             .block(Block::default().borders(Borders::ALL));
-        f.render_widget(header, left_chunks[0]);
+        f.render_widget(header, header_chunks[0]);
 
+        // Voice status indicator in header
+        if self.voice_connected {
+            let voice_status = if self.voice_muted {
+                ("MUTED", Color::Red)
+            } else if self.voice_deafened {
+                ("DEAF", Color::Red)
+            } else {
+                ("LIVE", Color::Green)
+            };
+            let voice_indicator = Paragraph::new(voice_status.0)
+                .style(Style::default().fg(voice_status.1).add_modifier(Modifier::BOLD))
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(voice_indicator, header_chunks[1]);
+        } else {
+            let voice_off = Paragraph::new("Voice OFF")
+                .style(Style::default().fg(Color::DarkGray))
+                .alignment(Alignment::Center)
+                .block(Block::default().borders(Borders::ALL));
+            f.render_widget(voice_off, header_chunks[1]);
+        }
+
+        // Room tabs
         let room_titles: Vec<String> = self
             .joined_rooms
             .iter()
@@ -1079,7 +1595,7 @@ impl TuiChatClient {
             .unwrap_or(0);
 
         let tabs = Tabs::new(room_titles)
-            .block(Block::default().borders(Borders::ALL).title("Rooms"))
+            .block(Block::default().borders(Borders::ALL).title("Rooms (Tab to switch)"))
             .style(Style::default().fg(Color::White))
             .highlight_style(
                 Style::default()
@@ -1089,30 +1605,66 @@ impl TuiChatClient {
             .select(selected_tab);
         f.render_widget(tabs, left_chunks[1]);
 
+        // Chat area
         self.draw_chat_area(f, left_chunks[2]);
 
+        // Input field with cursor
         let input_text = if self.cursor_visible {
             let mut text = self.input.clone();
-            text.insert(self.cursor_position, '│');
+            if self.cursor_position <= text.len() {
+                text.insert(self.cursor_position, '│');
+            }
             text
         } else {
             self.input.clone()
         };
 
+        let input_title = if let Some(room_id) = self.current_room {
+            format!("Message (Room {})", room_id)
+        } else {
+            "Message (join a room first)".to_string()
+        };
+
         let input = Paragraph::new(input_text.as_str())
             .style(Style::default().fg(Color::White))
-            .block(Block::default().borders(Borders::ALL).title("Message"));
+            .block(Block::default().borders(Borders::ALL).title(input_title));
         f.render_widget(input, left_chunks[3]);
 
-        let status_text = format!(
-            "Commands: F1-Help F2-Rooms F3-Private F4-Settings F5-Voice({}) ESC-Quit",
-            if self.voice_connected { "ON" } else { "OFF" }
-        );
-        let status = Paragraph::new(status_text).style(Style::default().fg(Color::Gray));
+        // Improved status bar
+        let voice_controls = if self.voice_connected {
+            format!("F5-Disconnect F6-Mute({}) F7-Deafen({})", 
+                if self.voice_muted { "ON" } else { "off" },
+                if self.voice_deafened { "ON" } else { "off" })
+        } else {
+            "F5-Voice".to_string()
+        };
+
+        let status_spans = vec![
+            Span::styled("F1", Style::default().fg(Color::Yellow)),
+            Span::raw("-Help "),
+            Span::styled("F2", Style::default().fg(Color::Yellow)),
+            Span::raw("-Rooms "),
+            Span::styled("F3", Style::default().fg(Color::Yellow)),
+            Span::raw("-DM "),
+            Span::styled("F4", Style::default().fg(Color::Yellow)),
+            Span::raw("-Settings "),
+            Span::styled(&voice_controls, Style::default().fg(if self.voice_connected { Color::Green } else { Color::Gray })),
+            Span::raw(" "),
+            Span::styled("ESC", Style::default().fg(Color::Red)),
+            Span::raw("-Quit"),
+        ];
+        let status = Paragraph::new(Line::from(status_spans))
+            .style(Style::default().fg(Color::Gray))
+            .alignment(Alignment::Center);
         f.render_widget(status, left_chunks[4]);
 
+        // User panel on the right
         self.draw_user_panel(f, main_chunks[1]);
 
+        // Draw notifications overlay
+        self.draw_notifications(f);
+
+        // Popups (render last so they're on top)
         if self.show_help {
             self.draw_help_popup(f);
         }
@@ -1128,29 +1680,54 @@ impl TuiChatClient {
     }
 
     fn draw_user_panel(&self, f: &mut Frame, area: Rect) {
+        let online_count = self.online_users.iter().filter(|u| u.is_online).count();
+        let title = format!("Users ({} online)", online_count);
+        
         let block = Block::default()
-            .title("Online Users")
+            .title(title)
             .borders(Borders::ALL)
             .style(Style::default().fg(Color::Green));
 
         if self.online_users.is_empty() {
-            let empty_text = Paragraph::new("No users online\n\nPress F3 for\nprivate messages")
+            let empty_text = Paragraph::new("No users yet\n\nPress F3 for\nprivate messages")
                 .style(Style::default().fg(Color::Gray))
                 .alignment(Alignment::Center)
                 .block(block);
             f.render_widget(empty_text, area);
         } else {
-            let user_items: Vec<ListItem> = self
-                .online_users
+            // Sort users: online first, then alphabetically
+            let mut sorted_users = self.online_users.clone();
+            sorted_users.sort_by(|a, b| {
+                match (a.is_online, b.is_online) {
+                    (true, false) => std::cmp::Ordering::Less,
+                    (false, true) => std::cmp::Ordering::Greater,
+                    _ => a.username.to_lowercase().cmp(&b.username.to_lowercase()),
+                }
+            });
+            
+            let user_items: Vec<ListItem> = sorted_users
                 .iter()
                 .map(|user| {
-                    let status_icon = if user.is_online { "●" } else { "○" };
-                    let style = if user.is_online {
-                        Style::default().fg(Color::Green)
+                    if user.is_online {
+                        // Online user - green dot, white name
+                        ListItem::new(Line::from(vec![
+                            Span::styled("● ", Style::default().fg(Color::Green)),
+                            Span::styled(&user.username, Style::default().fg(Color::White)),
+                        ]))
                     } else {
-                        Style::default().fg(Color::Gray)
-                    };
-                    ListItem::new(format!("{} {}", status_icon, user.username)).style(style)
+                        // Offline user - gray dot, gray name with last seen
+                        let last_seen = if user.last_seen.len() > 10 {
+                            // Show just time portion if today, or date
+                            &user.last_seen[11..16] // HH:MM
+                        } else {
+                            &user.last_seen
+                        };
+                        ListItem::new(Line::from(vec![
+                            Span::styled("○ ", Style::default().fg(Color::DarkGray)),
+                            Span::styled(&user.username, Style::default().fg(Color::DarkGray)),
+                            Span::styled(format!(" ({})", last_seen), Style::default().fg(Color::DarkGray)),
+                        ]))
+                    }
                 })
                 .collect();
             f.render_widget(List::new(user_items).block(block), area);
@@ -1195,34 +1772,44 @@ impl TuiChatClient {
     }
 
     fn draw_help_popup(&self, f: &mut Frame) {
-        let popup_area = Self::centered_rect_fixed(60, 16, f.area());
+        let popup_area = Self::centered_rect_fixed(65, 24, f.area());
         f.render_widget(Clear, popup_area);
 
         let help_text = vec![
             Line::from(vec![Span::styled(
-                "FCA Chat Help",
+                "FCA Chat - Help",
                 Style::default()
                     .fg(Color::Cyan)
                     .add_modifier(Modifier::BOLD),
             )]),
             Line::from(""),
-            Line::from("Navigation:"),
-            Line::from("  Tab       - Switch between rooms"),
-            Line::from("  F1        - Toggle this help"),
-            Line::from("  F2        - Room browser"),
-            Line::from("  F3        - Private messages"),
-            Line::from("  F4        - Settings"),
-            Line::from("  F5        - Start Voice Chat"),
-            Line::from("  Esc       - Close dialogs or quit"),
+            Line::from(vec![Span::styled("Navigation:", Style::default().fg(Color::Yellow))]),
+            Line::from("  Tab         Switch between rooms"),
+            Line::from("  ↑/↓         Scroll messages / Navigate lists"),
+            Line::from("  PgUp/PgDn   Scroll messages faster"),
+            Line::from("  Home/End    Jump to start/end of input"),
             Line::from(""),
-            Line::from("Chat Commands:"),
-            Line::from("  /join <id> [password] - Join a room"),
-            Line::from("  /create <name> <desc> [pass] - Create room"),
-            Line::from("  /leave <id> - Leave a room"),
+            Line::from(vec![Span::styled("Function Keys:", Style::default().fg(Color::Yellow))]),
+            Line::from("  F1          Toggle this help"),
+            Line::from("  F2          Room browser"),
+            Line::from("  F3          Private messages"),
+            Line::from("  F4          Settings (audio devices, voice)"),
+            Line::from("  F5          Toggle voice chat"),
+            Line::from("  F6          Toggle mute (when in voice)"),
+            Line::from("  F7          Toggle deafen (when in voice)"),
+            Line::from("  Esc         Close dialogs or quit"),
+            Line::from(""),
+            Line::from(vec![Span::styled("Chat Commands:", Style::default().fg(Color::Yellow))]),
+            Line::from("  /join <id> [password]          Join a room"),
+            Line::from("  /create <name> <desc> [pass]   Create a room"),
+            Line::from("  /leave <id>                    Leave a room"),
         ];
 
         let help = Paragraph::new(help_text)
-            .block(Block::default().title("Help").borders(Borders::ALL))
+            .block(Block::default()
+                .title("Help")
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::Cyan)))
             .wrap(Wrap { trim: true });
         f.render_widget(help, popup_area);
     }
@@ -1266,7 +1853,7 @@ impl TuiChatClient {
                         Style::default()
                     };
                     let lock_icon = if room.is_password_protected {
-                        "🔒 "
+                        "[LOCKED] "
                     } else {
                         ""
                     };
@@ -1288,8 +1875,8 @@ impl TuiChatClient {
             );
 
             let instructions = vec![
-                Line::from("↑↓ Navigate | Enter: Join Room | Esc: Close"),
-                Line::from("🔒 = Password Protected Room"),
+                Line::from("Up/Down: Navigate | Enter: Join Room | Esc: Close"),
+                Line::from("[LOCKED] = Password Protected Room"),
             ];
             f.render_widget(
                 Paragraph::new(instructions)
@@ -1385,13 +1972,254 @@ impl TuiChatClient {
     }
 
     fn draw_settings(&self, f: &mut Frame) {
-        let popup_area = Self::centered_rect_fixed(50, 10, f.area());
+        let popup_area = Self::centered_rect_fixed(70, 22, f.area());
         f.render_widget(Clear, popup_area);
-        f.render_widget(
-            Paragraph::new("Settings not yet implemented.")
-                .block(Block::default().title("Settings").borders(Borders::ALL)),
-            popup_area,
-        );
+
+        let block = Block::default()
+            .title("Settings")
+            .borders(Borders::ALL)
+            .style(Style::default().fg(Color::Cyan));
+        f.render_widget(block, popup_area);
+
+        let inner = popup_area.inner(ratatui::layout::Margin {
+            horizontal: 2,
+            vertical: 1,
+        });
+
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .constraints([
+                Constraint::Length(3),  // Tabs
+                Constraint::Min(10),    // Content
+                Constraint::Length(3),  // Controls
+            ])
+            .split(inner);
+
+        // Tab bar
+        let tab_titles = vec!["Audio", "Voice", "Interface"];
+        let selected_tab = match self.settings_tab {
+            SettingsTab::Audio => 0,
+            SettingsTab::Voice => 1,
+            SettingsTab::Interface => 2,
+        };
+        let tabs = Tabs::new(tab_titles)
+            .block(Block::default().borders(Borders::BOTTOM))
+            .style(Style::default().fg(Color::White))
+            .highlight_style(Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD))
+            .select(selected_tab);
+        f.render_widget(tabs, chunks[0]);
+
+        // Content based on selected tab
+        match self.settings_tab {
+            SettingsTab::Audio => self.draw_audio_settings(f, chunks[1]),
+            SettingsTab::Voice => self.draw_voice_settings(f, chunks[1]),
+            SettingsTab::Interface => self.draw_interface_settings(f, chunks[1]),
+        }
+
+        // Controls
+        let controls = Paragraph::new("Tab: Switch tabs | ↑↓: Navigate | ←→: Adjust | Esc: Close")
+            .style(Style::default().fg(Color::Gray))
+            .alignment(Alignment::Center)
+            .block(Block::default().borders(Borders::TOP));
+        f.render_widget(controls, chunks[2]);
+    }
+
+    fn draw_audio_settings(&self, f: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(3),  // Input device
+                Constraint::Length(3),  // Output device
+                Constraint::Length(3),  // Input volume
+                Constraint::Length(3),  // Output volume
+                Constraint::Min(0),     // Spacer
+            ])
+            .split(area);
+
+        // Input device selector
+        let input_device_name = self.selected_input_device().unwrap_or("No device");
+        let input_style = if self.settings_field == 0 {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let input_device = Paragraph::new(format!("◄ {} ►", input_device_name))
+            .alignment(Alignment::Center)
+            .block(Block::default()
+                .title("Input Device")
+                .borders(Borders::ALL)
+                .style(input_style));
+        f.render_widget(input_device, chunks[0]);
+
+        // Output device selector
+        let output_device_name = self.selected_output_device().unwrap_or("No device");
+        let output_style = if self.settings_field == 1 {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let output_device = Paragraph::new(format!("◄ {} ►", output_device_name))
+            .alignment(Alignment::Center)
+            .block(Block::default()
+                .title("Output Device")
+                .borders(Borders::ALL)
+                .style(output_style));
+        f.render_widget(output_device, chunks[1]);
+
+        // Input volume
+        let input_vol_style = if self.settings_field == 2 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Green)
+        };
+        let input_vol = Gauge::default()
+            .block(Block::default()
+                .title("Input Volume")
+                .borders(Borders::ALL)
+                .style(if self.settings_field == 2 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                }))
+            .gauge_style(input_vol_style)
+            .percent(self.audio_settings.input_volume as u16)
+            .label(format!("{}%", self.audio_settings.input_volume));
+        f.render_widget(input_vol, chunks[2]);
+
+        // Output volume
+        let output_vol_style = if self.settings_field == 3 {
+            Style::default().fg(Color::Yellow)
+        } else {
+            Style::default().fg(Color::Blue)
+        };
+        let output_vol = Gauge::default()
+            .block(Block::default()
+                .title("Output Volume")
+                .borders(Borders::ALL)
+                .style(if self.settings_field == 3 {
+                    Style::default().fg(Color::Yellow)
+                } else {
+                    Style::default()
+                }))
+            .gauge_style(output_vol_style)
+            .percent(self.audio_settings.output_volume as u16)
+            .label(format!("{}%", self.audio_settings.output_volume));
+        f.render_widget(output_vol, chunks[3]);
+    }
+
+    fn draw_voice_settings(&self, f: &mut Frame, area: Rect) {
+        let chunks = Layout::default()
+            .direction(Direction::Vertical)
+            .margin(1)
+            .constraints([
+                Constraint::Length(3),
+                Constraint::Length(3),
+                Constraint::Min(0),
+            ])
+            .split(area);
+
+        let mute_status = if self.voice_muted { "ON " } else { "OFF" };
+        let mute_style = if self.settings_field == 0 {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let mute_toggle = Paragraph::new(format!("[ {} ] (F6 to toggle)", mute_status))
+            .alignment(Alignment::Center)
+            .block(Block::default()
+                .title("Mute Microphone")
+                .borders(Borders::ALL)
+                .style(mute_style));
+        f.render_widget(mute_toggle, chunks[0]);
+
+        let deafen_status = if self.voice_deafened { "ON " } else { "OFF" };
+        let deafen_style = if self.settings_field == 1 {
+            Style::default().fg(Color::Yellow).add_modifier(Modifier::BOLD)
+        } else {
+            Style::default()
+        };
+        let deafen_toggle = Paragraph::new(format!("[ {} ] (F7 to toggle)", deafen_status))
+            .alignment(Alignment::Center)
+            .block(Block::default()
+                .title("Deafen (Mute Speakers)")
+                .borders(Borders::ALL)
+                .style(deafen_style));
+        f.render_widget(deafen_toggle, chunks[1]);
+    }
+
+    fn draw_interface_settings(&self, f: &mut Frame, area: Rect) {
+        let content = Paragraph::new(vec![
+            Line::from(""),
+            Line::from("Interface customization coming soon!"),
+            Line::from(""),
+            Line::from("Planned features:"),
+            Line::from("  • Color themes"),
+            Line::from("  • Timestamp format"),
+            Line::from("  • Message display options"),
+        ])
+        .alignment(Alignment::Center)
+        .style(Style::default().fg(Color::Gray))
+        .block(Block::default().borders(Borders::ALL));
+        f.render_widget(content, area);
+    }
+
+    fn draw_notifications(&self, f: &mut Frame) {
+        if self.notifications.is_empty() {
+            return;
+        }
+
+        let area = f.area();
+        let notification_height = self.notifications.len().min(5) as u16;
+        let notification_area = Rect {
+            x: area.width.saturating_sub(42),
+            y: 1,
+            width: 40,
+            height: notification_height * 2 + 1,
+        };
+
+        let items: Vec<ListItem> = self.notifications
+            .iter()
+            .rev()
+            .take(5)
+            .map(|n| {
+                let (prefix, color) = match n.notification_type {
+                    NotificationType::Success => ("[OK]", Color::Green),
+                    NotificationType::Info => ("[i]", Color::Cyan),
+                    NotificationType::Warning => ("[!]", Color::Yellow),
+                    NotificationType::Error => ("[X]", Color::Red),
+                };
+                ListItem::new(format!(" {} {}", prefix, n.message))
+                    .style(Style::default().fg(color))
+            })
+            .collect();
+
+        if !items.is_empty() {
+            let block = Block::default()
+                .borders(Borders::ALL)
+                .style(Style::default().fg(Color::DarkGray));
+            f.render_widget(Clear, notification_area);
+            f.render_widget(List::new(items).block(block), notification_area);
+        }
+    }
+
+    fn draw_voice_indicator(&self, f: &mut Frame, area: Rect) {
+        if !self.voice_connected {
+            return;
+        }
+
+        let voice_status = if self.voice_muted {
+            ("MUTED", Color::Red)
+        } else if self.voice_deafened {
+            ("DEAF", Color::Red)
+        } else {
+            ("LIVE", Color::Green)
+        };
+
+        let indicator = Paragraph::new(voice_status.0)
+            .style(Style::default().fg(voice_status.1).add_modifier(Modifier::BOLD))
+            .alignment(Alignment::Right);
+        f.render_widget(indicator, area);
     }
 
     fn centered_rect_fixed(width: u16, height: u16, r: Rect) -> Rect {

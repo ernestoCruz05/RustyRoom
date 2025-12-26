@@ -23,3 +23,6 @@ chrono = { version = "0.4", features = ["serde"] }
 cpal = "0.16"
 ringbuf = "0.4"
 anyhow = "1.0"
+opus = "0.3"                     # Opus audio codec for compression
+bytes = "1.5"                    # Efficient byte manipulation
+byteorder = "1.5"                # Byte order encoding/decoding

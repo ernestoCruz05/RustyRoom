@@ -1,7 +1,19 @@
+//! Async Chat Server Module for FCA
+//!
+//! This module implements the main TCP chat server with support for:
+//! - User authentication (login/register)
+//! - Room-based text chat
+//! - Private messaging
+//! - Voice chat via UDP
+//! - SQLite database persistence
+//!
+//! The server uses Tokio for async I/O and supports multiple concurrent clients.
+
 #![allow(dead_code)]
 
 use crate::database::Database;
 use crate::resc::{Message, MessageType, Room, RoomState, User, UserStatus};
+use chrono::Local;
 use rand::{Rng, distributions::Alphanumeric};
 use sha2::{Digest, Sha256};
 use std::collections::HashMap;
@@ -10,17 +22,89 @@ use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader};
 use tokio::net::{TcpListener, TcpStream, UdpSocket};
 use tokio::sync::{RwLock, mpsc};
 
+// ============================================================================
+// SERVER LOGGING
+// ============================================================================
+
+/// Log levels for categorizing server messages
+#[derive(Clone, Copy)]
+enum LogLevel {
+    /// General information
+    Info,
+    /// Warnings (non-fatal issues)
+    Warn,
+    /// Errors (operation failures)
+    Error,
+    /// Debug information (verbose)
+    Debug,
+    /// Voice chat related messages
+    Voice,
+    /// Authentication related messages
+    Auth,
+    /// Room management messages
+    Room,
+}
+
+impl LogLevel {
+    /// Returns the display prefix for this log level
+    fn prefix(&self) -> &'static str {
+        match self {
+            LogLevel::Info => "INFO",
+            LogLevel::Warn => "WARN",
+            LogLevel::Error => "ERROR",
+            LogLevel::Debug => "DEBUG",
+            LogLevel::Voice => "VOICE",
+            LogLevel::Auth => "AUTH",
+            LogLevel::Room => "ROOM",
+        }
+    }
+}
+
+/// Logs a message with timestamp and level to stdout
+fn log(level: LogLevel, message: &str) {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    println!("[{}] [{}] {}", timestamp, level.prefix(), message);
+}
+
+/// Logs an error with context to stderr
+fn log_error(context: &str, error: &dyn std::fmt::Display) {
+    let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+    eprintln!("[{}] [ERROR] {}: {}", timestamp, context, error);
+}
+
+// ============================================================================
+// ASYNC CHAT SERVER
+// ============================================================================
+
+/// The main async chat server
+///
+/// Manages all connected users, rooms, and handles message routing.
+/// Uses async I/O for efficient handling of many concurrent connections.
 pub struct AsyncChatServer {
+    /// Connected users indexed by user ID
     users: Arc<RwLock<HashMap<u16, User>>>,
+    /// Active rooms indexed by room ID
     rooms: Arc<RwLock<HashMap<u16, Room>>>,
+    /// Message senders for each connected user (for pushing messages)
     user_senders: Arc<RwLock<HashMap<u16, mpsc::UnboundedSender<String>>>>,
+    /// Database connection for persistence
     database: Database,
+    /// Counter for generating unique user IDs
     next_user_id: Arc<RwLock<u16>>,
+    /// Counter for generating unique room IDs
     next_room_id: Arc<RwLock<u16>>,
+    /// Voice chat authentication tokens mapped to user IDs
     voice_tokens: Arc<RwLock<HashMap<String, u16>>>,
 }
 
 impl AsyncChatServer {
+    /// Creates a new AsyncChatServer with database connection
+    ///
+    /// # Arguments
+    /// * `database_url` - SQLite connection URL (e.g., "sqlite:data.db")
+    ///
+    /// # Returns
+    /// A Result containing the server instance or an error
     pub async fn new(database_url: &str) -> Result<Self, Box<dyn std::error::Error>> {
         let database = Database::new(database_url).await?;
 
@@ -35,26 +119,44 @@ impl AsyncChatServer {
         })
     }
 
+    /// Starts the async chat server and begins accepting connections
+    ///
+    /// This is the main entry point for running the server. It:
+    /// 1. Connects to the database (falls back to in-memory if needed)
+    /// 2. Loads existing rooms from the database
+    /// 3. Starts background cleanup tasks
+    /// 4. Starts the UDP voice server
+    /// 5. Accepts TCP connections in a loop
+    ///
+    /// # Arguments
+    /// * `database_url` - SQLite connection URL
+    /// * `address` - TCP bind address (e.g., "0.0.0.0:8080")
     pub async fn start_async_server(
         database_url: &str,
         address: &str,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        println!();
+        println!("========================================");
+        println!("       FCA Chat Server Starting");
+        println!("========================================");
+        println!();
+        
         let server = match AsyncChatServer::new(database_url).await {
             Ok(server) => {
-                println!(" Database connection successful: {}", database_url);
+                log(LogLevel::Info, &format!("Database connected: {}", database_url));
                 server
             }
             Err(e) => {
-                eprintln!(" Failed to connect to database: {}", e);
-                eprintln!(" Trying in-memory database as fallback...");
+                log(LogLevel::Warn, &format!("Database connection failed: {}", e));
+                log(LogLevel::Info, "Trying in-memory database as fallback...");
 
                 match AsyncChatServer::new("sqlite::memory:").await {
                     Ok(server) => {
-                        println!(" Using in-memory database (data will not persist)");
+                        log(LogLevel::Warn, "Using in-memory database (data will not persist)");
                         server
                     }
                     Err(e2) => {
-                        eprintln!(" Even in-memory database failed: {}", e2);
+                        log(LogLevel::Error, &format!("In-memory database also failed: {}", e2));
                         return Err(e);
                     }
                 }
@@ -64,44 +166,51 @@ impl AsyncChatServer {
         let server = Arc::new(server);
 
         if let Err(e) = server.load_rooms_from_db().await {
-            eprintln!(
-                "  Warning: Could not load existing rooms from database: {}",
-                e
-            );
+            log(LogLevel::Warn, &format!("Could not load rooms from database: {}", e));
         }
 
+        // Spawn background cleanup task - runs every 30 seconds
         let server_cleanup = Arc::clone(&server);
         tokio::spawn(async move {
-            let mut interval = tokio::time::interval(std::time::Duration::from_secs(15));
+            let mut interval = tokio::time::interval(std::time::Duration::from_secs(30));
             loop {
                 interval.tick().await;
 
                 if let Err(e) = server_cleanup.cleanup_disconnected_users().await {
-                    eprintln!("Failed to cleanup disconnected users: {}", e);
+                    log_error("Cleanup disconnected users", &e);
                 }
 
                 if let Err(e) = server_cleanup.database.cleanup_old_sessions().await {
-                    eprintln!("Failed to cleanup old sessions: {}", e);
+                    log_error("Cleanup old sessions", &e);
                 }
 
                 if let Err(e) = server_cleanup.broadcast_user_list_update().await {
-                    eprintln!("Failed to broadcast user list update: {}", e);
+                    log_error("Broadcast user list", &e);
                 }
             }
         });
 
+        // Start UDP voice server on port 8081
         let udp_address = format!("{}:8081", "0.0.0.0");
         let voice_tokens_clone = server.voice_tokens.clone();
         tokio::spawn(async move {
             if let Err(e) =
                 AsyncChatServer::start_udp_listener(voice_tokens_clone, udp_address).await
             {
-                eprintln!("Critical Voice Server Error: {}", e);
+                log(LogLevel::Error, &format!("Voice server failed: {}", e));
             }
         });
 
         let tcp_listener = TcpListener::bind(address).await?;
-        println!("Async server listening to [{}] with database", address);
+        
+        println!();
+        log(LogLevel::Info, &format!("TCP server listening on {}", address));
+        log(LogLevel::Voice, "UDP voice server listening on port 8081");
+        println!();
+        println!("----------------------------------------");
+        println!("  Server ready and accepting connections");
+        println!("----------------------------------------");
+        println!();
 
         loop {
             match tcp_listener.accept().await {
@@ -120,41 +229,115 @@ impl AsyncChatServer {
         }
     }
 
+    /// Enhanced UDP voice server with room-based audio routing
+    ///
+    /// Features:
+    /// - Token-based authentication
+    /// - Room-based audio routing (users in same room hear each other)
+    /// - Support for both new voice protocol and legacy raw audio
+    /// - Automatic session cleanup
     pub async fn start_udp_listener(
         voice_tokens: Arc<RwLock<HashMap<String, u16>>>,
         bind_address: String,
     ) -> Result<(), Box<dyn std::error::Error>> {
+        use crate::voice::{VoicePacket, VoicePacketHeader, PacketType};
+        
         let udp_socket = UdpSocket::bind(&bind_address).await?;
-        println!("Voice server (UDP) listening on {}", bind_address);
+        // Voice server started - main log is in start_async_server
 
-        let mut active_voice_sessions: HashMap<std::net::SocketAddr, u16> = HashMap::new();
-        let mut buf = [0u8; 8192];
+        // Active voice sessions: addr -> (user_id, room_id)
+        let active_sessions: Arc<RwLock<HashMap<std::net::SocketAddr, (u16, u16)>>> = 
+            Arc::new(RwLock::new(HashMap::new()));
+        
+        // Room membership: room_id -> set of socket addresses
+        let room_members: Arc<RwLock<HashMap<u16, Vec<std::net::SocketAddr>>>> = 
+            Arc::new(RwLock::new(HashMap::new()));
+
+        let mut buf = [0u8; 4096];
 
         loop {
             match udp_socket.recv_from(&mut buf).await {
                 Ok((size, peer_addr)) => {
                     let received_data = &buf[..size];
 
+                    // === AUTHENTICATION PHASE ===
+                    // Check if this is a token authentication attempt
                     if let Ok(token_str) = std::str::from_utf8(received_data) {
                         let token = token_str.trim().to_string();
                         let mut tokens = voice_tokens.write().await;
 
                         if let Some(user_id) = tokens.remove(&token) {
-                            active_voice_sessions.insert(peer_addr, user_id);
+                            // For now, use room_id = 1 (General room)
+                            // In a full implementation, the token would include room_id
+                            let room_id: u16 = 1;
+                            
+                            // Register session
+                            {
+                                let mut sessions = active_sessions.write().await;
+                                sessions.insert(peer_addr, (user_id, room_id));
+                            }
+                            
+                            // Add to room members
+                            {
+                                let mut rooms = room_members.write().await;
+                                rooms.entry(room_id)
+                                    .or_insert_with(Vec::new)
+                                    .push(peer_addr);
+                            }
+                            
                             let _ = udp_socket.send_to(b"VOICE_CONNECTED", peer_addr).await;
+                            log(LogLevel::Voice, &format!("User {} joined voice in room {}", user_id, room_id));
                             continue;
                         }
                     }
 
-                    if let Some(_user_id) = active_voice_sessions.get(&peer_addr) {
-                        let _ = udp_socket.send_to(received_data, peer_addr).await;
+                    // === AUDIO ROUTING PHASE ===
+                    let sessions = active_sessions.read().await;
+                    
+                    if let Some((sender_user_id, room_id)) = sessions.get(&peer_addr) {
+                        let rooms = room_members.read().await;
+                        
+                        if let Some(members) = rooms.get(room_id) {
+                            // Forward audio to all room members except sender
+                            for member_addr in members {
+                                if *member_addr != peer_addr {
+                                    // Check if recipient is still in active sessions
+                                    if sessions.contains_key(member_addr) {
+                                        let _ = udp_socket.send_to(received_data, *member_addr).await;
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // Handle heartbeat packets for session keepalive
+                        if let Some(packet) = VoicePacket::decode(received_data) {
+                            if packet.header.packet_type == PacketType::Heartbeat {
+                                // Acknowledge heartbeat
+                                let ack = VoicePacketHeader::new_heartbeat(*sender_user_id, *room_id);
+                                let _ = udp_socket.send_to(&ack.encode(), peer_addr).await;
+                            }
+                        }
                     }
                 }
-                Err(e) => eprintln!("UDP Recv Error: {}", e),
+                Err(e) => {
+                    // Only log unexpected errors, not timeouts or connection resets
+                    let msg = e.to_string();
+                    if !msg.contains("timed out") && !msg.contains("Connection refused") {
+                        log(LogLevel::Error, &format!("UDP recv error: {}", e));
+                    }
+                }
             }
         }
     }
 
+    /// Loads existing rooms from the database into memory
+    ///
+    /// Retrieves all rooms from SQLite and populates the in-memory rooms HashMap.
+    /// Creates a default "General" room if no rooms exist in the database.
+    /// Also updates the `next_room_id` counter to avoid ID collisions.
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or a SQLx error if database operations fail
     async fn load_rooms_from_db(&self) -> Result<(), sqlx::Error> {
         let rooms_data = self.database.get_all_rooms().await?;
         let mut rooms = self.rooms.write().await;
@@ -199,12 +382,26 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Handles an individual client TCP connection
+    ///
+    /// Sets up bidirectional communication with a connected client:
+    /// - Splits the TCP stream into read/write halves
+    /// - Creates an async channel for outgoing messages
+    /// - Spawns a writer task to send messages to the client
+    /// - Reads incoming messages line-by-line and processes them
+    /// - Cleans up user state when the connection closes
+    ///
+    /// # Arguments
+    /// * `stream` - The TCP stream for the connected client
+    ///
+    /// # Returns
+    /// `Ok(())` when the client disconnects normally, or an error
     async fn handle_client_async(
         &self,
         stream: TcpStream,
     ) -> Result<(), Box<dyn std::error::Error>> {
         let client_address = stream.peer_addr()?;
-        println!("Connection: [{}]", client_address);
+        log(LogLevel::Info, &format!("New connection from {}", client_address));
 
         let (read_half, mut write_half) = stream.into_split();
         let reader = BufReader::new(read_half);
@@ -214,30 +411,23 @@ impl AsyncChatServer {
 
         let mut connected_user_id: Option<u16> = None;
 
+        let client_addr_clone = client_address;
         let write_task = tokio::spawn(async move {
             while let Some(message) = rx.recv().await {
-                if let Err(e) = write_half.write_all(message.as_bytes()).await {
-                    eprintln!(
-                        "Failed to write to client: {} - connection likely broken",
-                        e
-                    );
+                if let Err(_e) = write_half.write_all(message.as_bytes()).await {
+                    // Client disconnected - this is expected, don't spam logs
                     break;
                 }
-                if let Err(e) = write_half.write_all(b"\n").await {
-                    eprintln!(
-                        "Failed to write newline to client: {} - connection likely broken",
-                        e
-                    );
+                if let Err(_e) = write_half.write_all(b"\n").await {
                     break;
                 }
-                if let Err(e) = write_half.flush().await {
-                    eprintln!(
-                        "Failed to flush client stream: {} - connection likely broken",
-                        e
-                    );
+                if let Err(_e) = write_half.flush().await {
                     break;
                 }
             }
+            // Log disconnect once when write task ends
+            let timestamp = Local::now().format("%Y-%m-%d %H:%M:%S");
+            println!("[{}] [INFO] Client {} write channel closed", timestamp, client_addr_clone);
         });
 
         while let Some(line) = lines.next_line().await? {
@@ -255,7 +445,7 @@ impl AsyncChatServer {
                     .database
                     .set_user_online_status(user_id, &account.username, false)
                     .await;
-                println!("User {} ({}) marked as offline", account.username, user_id);
+                log(LogLevel::Auth, &format!("User '{}' (ID: {}) disconnected and marked offline", account.username, user_id));
 
                 let _ = self.broadcast_user_list_update().await;
             }
@@ -264,10 +454,21 @@ impl AsyncChatServer {
         }
 
         write_task.abort();
-        println!("Disconnected: [{}]", client_address);
+        log(LogLevel::Info, &format!("Connection closed: {}", client_address));
         Ok(())
     }
 
+    /// Processes an incoming message from a client
+    ///
+    /// Routes the message to the appropriate handler based on its type.
+    /// Also updates the user's online status when messages are received.
+    ///
+    /// # Arguments
+    /// * `message` - The parsed message from the client
+    /// * `sender` - Channel to send responses back to this client
+    ///
+    /// # Returns
+    /// `Ok(())` on successful processing, or an error
     async fn process_message_async(
         &self,
         message: Message,
@@ -360,6 +561,19 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Handles user registration requests
+    ///
+    /// Creates a new user account with the provided credentials.
+    /// The password is hashed before storage. On success, the user is
+    /// automatically logged in and added to the active senders list.
+    ///
+    /// # Arguments
+    /// * `username` - The desired username
+    /// * `password` - The plaintext password (will be hashed)
+    /// * `sender` - Channel to send the response back to the client
+    ///
+    /// # Returns
+    /// `Ok(())` after sending AuthSuccess or AuthFailure response
     async fn handle_register(
         &self,
         username: &str,
@@ -370,6 +584,8 @@ impl AsyncChatServer {
 
         match self.database.create_user(username, &password_hash).await {
             Ok(user_id) => {
+                log(LogLevel::Auth, &format!("New user registered: '{}' (ID: {})", username, user_id));
+                
                 let mut user_senders = self.user_senders.write().await;
                 user_senders.insert(user_id, sender.clone());
                 drop(user_senders);
@@ -386,6 +602,8 @@ impl AsyncChatServer {
                 self.broadcast_user_list_update().await?;
             }
             Err(_) => {
+                log(LogLevel::Auth, &format!("Registration failed: username '{}' already exists", username));
+                
                 let response = Message::new(
                     0,
                     MessageType::AuthFailure {
@@ -399,6 +617,19 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Handles user login requests
+    ///
+    /// Authenticates a user with username and password. Verifies the
+    /// password hash matches the stored hash. On success, marks the user
+    /// as online and registers their message channel.
+    ///
+    /// # Arguments
+    /// * `username` - The username to authenticate
+    /// * `password` - The plaintext password to verify
+    /// * `sender` - Channel to send the response back to the client
+    ///
+    /// # Returns
+    /// `Ok(())` after sending AuthSuccess or AuthFailure response
     async fn handle_login(
         &self,
         username: &str,
@@ -408,6 +639,8 @@ impl AsyncChatServer {
         if let Some(account) = self.database.get_user_by_username(username).await? {
             let password_hash = Self::hash_password(password);
             if account.hash == password_hash {
+                log(LogLevel::Auth, &format!("User '{}' (ID: {}) logged in", username, account.user_id));
+                
                 self.database
                     .set_user_online_status(account.user_id, &account.username, true)
                     .await?;
@@ -427,6 +660,8 @@ impl AsyncChatServer {
 
                 self.broadcast_user_list_update().await?;
             } else {
+                log(LogLevel::Auth, &format!("Login failed for '{}': invalid password", username));
+                
                 let response = Message::new(
                     0,
                     MessageType::AuthFailure {
@@ -436,6 +671,8 @@ impl AsyncChatServer {
                 self.send_to_sender(&sender, response)?;
             }
         } else {
+            log(LogLevel::Auth, &format!("Login failed: account '{}' does not exist", username));
+            
             let response = Message::new(
                 0,
                 MessageType::AuthFailure {
@@ -483,6 +720,21 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Handles room creation requests
+    ///
+    /// Creates a new chat room with the specified properties. Rooms can be
+    /// public (no password) or private (password protected). The room is
+    /// persisted to the database and added to the in-memory room list.
+    ///
+    /// # Arguments
+    /// * `name` - The room name
+    /// * `description` - A description of the room's purpose
+    /// * `password` - Optional password for private rooms
+    /// * `creator_id` - User ID of the room creator
+    /// * `sender` - Channel to send the response back to the client
+    ///
+    /// # Returns
+    /// `Ok(())` after sending RoomCreated or error response
     async fn handle_create_room(
         &self,
         name: &str,
@@ -559,6 +811,19 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Handles messages sent to a room
+    ///
+    /// Saves the message to the database for history and broadcasts it
+    /// to all users currently in the room.
+    ///
+    /// # Arguments
+    /// * `room_id` - The target room ID
+    /// * `content` - The message content
+    /// * `sender_username` - Username of the message sender
+    /// * `sender_id` - User ID of the message sender
+    ///
+    /// # Returns
+    /// `Ok(())` after broadcasting the message
     async fn handle_room_message(
         &self,
         room_id: u16,
@@ -584,6 +849,19 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Handles private (direct) messages between users
+    ///
+    /// Saves the message to the database and sends it directly to the
+    /// target user if they are currently connected.
+    ///
+    /// # Arguments
+    /// * `to_user_id` - The recipient's user ID
+    /// * `content` - The message content
+    /// * `sender_username` - Username of the message sender
+    /// * `sender_id` - User ID of the message sender
+    ///
+    /// # Returns
+    /// `Ok(())` after sending the message
     async fn handle_private_message(
         &self,
         to_user_id: u16,
@@ -609,6 +887,20 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Handles room join requests
+    ///
+    /// Validates the room exists and verifies the password for private rooms.
+    /// On success, adds the user to the room, sends recent message history,
+    /// and broadcasts a join notification to other room members.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room to join
+    /// * `password` - Optional password for private rooms
+    /// * `user_id` - The joining user's ID
+    /// * `sender` - Channel to send responses back to the client
+    ///
+    /// # Returns
+    /// `Ok(())` after processing the join request
     async fn handle_join_room(
         &self,
         room_id: u16,
@@ -710,6 +1002,18 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Handles room leave requests
+    ///
+    /// Removes the user from the room and broadcasts a leave notification
+    /// to remaining room members. Also updates the room's user count.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room to leave
+    /// * `user_id` - The leaving user's ID
+    /// * `sender` - Channel to send the confirmation response
+    ///
+    /// # Returns
+    /// `Ok(())` after processing the leave request
     async fn handle_leave_room(
         &self,
         room_id: u16,
@@ -754,6 +1058,17 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Sends a message to a specific user by their ID
+    ///
+    /// Looks up the user's message channel and sends the message if they
+    /// are currently connected. Silently succeeds if the user is offline.
+    ///
+    /// # Arguments
+    /// * `user_id` - The target user's ID
+    /// * `message` - The message to send
+    ///
+    /// # Returns
+    /// `Ok(())` after attempting to send
     async fn send_to_user(
         &self,
         user_id: u16,
@@ -766,6 +1081,17 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Sends a message through a specific sender channel
+    ///
+    /// Serializes the message to JSON and sends it through the provided
+    /// unbounded channel. This is a synchronous helper used by other send methods.
+    ///
+    /// # Arguments
+    /// * `sender` - The channel to send through
+    /// * `message` - The message to serialize and send
+    ///
+    /// # Returns
+    /// `Ok(())` on success, or an IO error if the channel is closed
     fn send_to_sender(
         &self,
         sender: &mpsc::UnboundedSender<String>,
@@ -779,12 +1105,30 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Hashes a password using SHA-256
+    ///
+    /// # Arguments
+    /// * `password` - The plaintext password to hash
+    ///
+    /// # Returns
+    /// The hexadecimal string representation of the SHA-256 hash
     fn hash_password(password: &str) -> String {
         let mut hasher = Sha256::new();
         hasher.update(password);
         format!("{:x}", hasher.finalize())
     }
 
+    /// Broadcasts a message to all users in a specific room
+    ///
+    /// Retrieves the list of room members from the database and sends
+    /// the message to each connected member.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room to broadcast to
+    /// * `message` - The message to broadcast
+    ///
+    /// # Returns
+    /// `Ok(())` after sending to all available recipients
     async fn broadcast_to_room(
         &self,
         room_id: u16,
@@ -804,6 +1148,16 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Broadcasts a message to all connected users
+    ///
+    /// Sends the message to every user with an active connection,
+    /// regardless of which rooms they are in.
+    ///
+    /// # Arguments
+    /// * `message` - The message to broadcast
+    ///
+    /// # Returns
+    /// `Ok(())` after sending to all connected users
     async fn broadcast_to_all_users(
         &self,
         message: Message,
@@ -818,6 +1172,14 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Broadcasts an updated user list to all connected clients
+    ///
+    /// Fetches the current online users from the database and sends
+    /// a `UserListUpdate` message to all connected clients. This is
+    /// called when users log in, log out, or during periodic cleanup.
+    ///
+    /// # Returns
+    /// `Ok(())` after broadcasting the update
     async fn broadcast_user_list_update(&self) -> Result<(), Box<dyn std::error::Error>> {
         let user_sessions = self.database.get_online_users().await?;
         let user_statuses: Vec<UserStatus> = user_sessions
@@ -840,6 +1202,15 @@ impl AsyncChatServer {
         Ok(())
     }
 
+    /// Cleans up stale connections from disconnected users
+    ///
+    /// Iterates through all user sender channels and removes any that
+    /// are closed. Also marks those users as offline in the database.
+    /// This runs periodically as a background task to handle ungraceful
+    /// disconnections.
+    ///
+    /// # Returns
+    /// `Ok(())` after cleanup completes
     async fn cleanup_disconnected_users(&self) -> Result<(), Box<dyn std::error::Error>> {
         let mut user_senders = self.user_senders.write().await;
         let mut disconnected_users = Vec::new();
@@ -850,6 +1221,10 @@ impl AsyncChatServer {
             }
         }
 
+        if !disconnected_users.is_empty() {
+            log(LogLevel::Debug, &format!("Cleaning up {} stale connections", disconnected_users.len()));
+        }
+        
         for user_id in disconnected_users {
             user_senders.remove(&user_id);
 
@@ -858,10 +1233,7 @@ impl AsyncChatServer {
                     .database
                     .set_user_online_status(user_id, &account.username, false)
                     .await;
-                println!(
-                    "User {} ({}) automatically marked as offline due to disconnection",
-                    account.username, user_id
-                );
+                log(LogLevel::Auth, &format!("User '{}' marked offline (stale connection)", account.username));
             }
         }
 

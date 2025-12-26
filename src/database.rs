@@ -39,6 +39,16 @@ pub struct Database {
 }
 
 impl Database {
+    /// Creates a new database connection and initializes the schema.
+    ///
+    /// Establishes a connection pool to the SQLite database at the given URL
+    /// and creates all required tables if they don't exist.
+    ///
+    /// # Arguments
+    /// * `database_url` - SQLite connection string (e.g., "sqlite:chat.db" or "sqlite::memory:")
+    ///
+    /// # Errors
+    /// Returns an error if the connection fails or table initialization fails.
     pub async fn new(database_url: &str) -> Result<Self, sqlx::Error> {
         println!(" Attempting database connection: {}", database_url);
         
@@ -75,6 +85,10 @@ impl Database {
         Ok(db)
     }
 
+    /// Initializes the database schema by creating all required tables.
+    ///
+    /// Creates tables for users, rooms, room memberships, messages, and user sessions.
+    /// Uses CREATE TABLE IF NOT EXISTS, so it's safe to call on an existing database.
     async fn init_tables(&self) -> Result<(), sqlx::Error> {
         // Users table
         sqlx::query(
@@ -163,6 +177,14 @@ impl Database {
         Ok(())
     }
 
+    /// Creates a new user account in the database.
+    ///
+    /// # Arguments
+    /// * `username` - Unique username for the new account
+    /// * `password_hash` - Pre-hashed password (caller must hash before calling)
+    ///
+    /// # Returns
+    /// The newly assigned user ID on success.
     pub async fn create_user(&self, username: &str, password_hash: &str) -> Result<u16, sqlx::Error> {
         let result = sqlx::query(
             "INSERT INTO users (username, password_hash) VALUES (?, ?) RETURNING id"
@@ -175,6 +197,13 @@ impl Database {
         Ok(result.get::<i64, _>("id") as u16)
     }
 
+    /// Retrieves a user account by username.
+    ///
+    /// # Arguments
+    /// * `username` - The username to look up
+    ///
+    /// # Returns
+    /// `Some(Account)` if found, `None` if no user exists with that username.
     pub async fn get_user_by_username(&self, username: &str) -> Result<Option<Account>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT id, username, password_hash FROM users WHERE username = ?"
@@ -193,6 +222,13 @@ impl Database {
         }
     }
 
+    /// Retrieves a user account by user ID.
+    ///
+    /// # Arguments
+    /// * `user_id` - The unique user ID to look up
+    ///
+    /// # Returns
+    /// `Some(Account)` if found, `None` if no user exists with that ID.
     pub async fn get_user_by_id(&self, user_id: u16) -> Result<Option<Account>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT id, username, password_hash FROM users WHERE id = ?"
@@ -211,6 +247,15 @@ impl Database {
         }
     }
 
+    /// Updates a user's online/offline status.
+    ///
+    /// Updates both the user_sessions table and the users table.
+    /// Also updates the last_activity/last_seen timestamps.
+    ///
+    /// # Arguments
+    /// * `user_id` - The user's ID
+    /// * `username` - The user's username
+    /// * `is_online` - `true` if the user is coming online, `false` if going offline
     pub async fn set_user_online_status(&self, user_id: u16, username: &str, is_online: bool) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -238,6 +283,11 @@ impl Database {
         Ok(())
     }
 
+    /// Retrieves all user sessions, ordered by online status and username.
+    ///
+    /// # Returns
+    /// A list of `UserSession` structs containing user info and online status.
+    /// Online users appear first, then sorted alphabetically by username.
     pub async fn get_online_users(&self) -> Result<Vec<UserSession>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
@@ -263,6 +313,15 @@ impl Database {
         Ok(users)
     }
 
+    /// Creates a new chat room in the database.
+    ///
+    /// # Arguments
+    /// * `id` - Unique room ID
+    /// * `name` - Display name for the room
+    /// * `description` - Room description
+    /// * `state` - Room visibility state (Open, Private, or Closed)
+    /// * `password_hash` - Optional password hash for protected rooms
+    /// * `created_by` - User ID of the room creator
     pub async fn create_room(&self, id: u16, name: &str, description: &str, state: &RoomState, password_hash: Option<&str>, created_by: u16) -> Result<(), sqlx::Error> {
         let state_str = match state {
             RoomState::Open => "Open",
@@ -285,6 +344,14 @@ impl Database {
         Ok(())
     }
 
+    /// Creates a system-managed room (e.g., lobby, announcements).
+    ///
+    /// System rooms have no creator (created_by is NULL) and are always open.
+    ///
+    /// # Arguments
+    /// * `id` - Unique room ID
+    /// * `name` - Display name for the room
+    /// * `description` - Room description
     pub async fn create_system_room(&self, id: u16, name: &str, description: &str) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT INTO rooms (id, name, description, state, password_hash, created_by) VALUES (?, ?, ?, ?, ?, NULL)"
@@ -300,6 +367,13 @@ impl Database {
         Ok(())
     }
 
+    /// Retrieves a room by its ID.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room ID to look up
+    ///
+    /// # Returns
+    /// `Some(Room)` if found, `None` if no room exists with that ID.
     pub async fn get_room(&self, room_id: u16) -> Result<Option<Room>, sqlx::Error> {
         let row = sqlx::query(
             "SELECT id, name, description, state, password_hash FROM rooms WHERE id = ?"
@@ -339,6 +413,11 @@ impl Database {
         }
     }
 
+    /// Retrieves summary information for all rooms.
+    ///
+    /// # Returns
+    /// A list of `RoomInfo` structs ordered by room name, containing
+    /// basic room details and whether the room is password-protected.
     pub async fn get_all_rooms(&self) -> Result<Vec<RoomInfo>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT id, name, description, password_hash FROM rooms ORDER BY name"
@@ -359,6 +438,13 @@ impl Database {
         Ok(rooms)
     }
 
+    /// Adds a user to a room's membership list.
+    ///
+    /// Uses INSERT OR IGNORE to safely handle duplicate join attempts.
+    ///
+    /// # Arguments
+    /// * `user_id` - The user ID to add
+    /// * `room_id` - The room ID to join
     pub async fn add_user_to_room(&self, user_id: u16, room_id: u16) -> Result<(), sqlx::Error> {
         sqlx::query(
             "INSERT OR IGNORE INTO room_memberships (user_id, room_id) VALUES (?, ?)"
@@ -371,6 +457,11 @@ impl Database {
         Ok(())
     }
 
+    /// Removes a user from a room's membership list.
+    ///
+    /// # Arguments
+    /// * `user_id` - The user ID to remove
+    /// * `room_id` - The room ID to leave
     pub async fn remove_user_from_room(&self, user_id: u16, room_id: u16) -> Result<(), sqlx::Error> {
         sqlx::query(
             "DELETE FROM room_memberships WHERE user_id = ? AND room_id = ?"
@@ -383,6 +474,13 @@ impl Database {
         Ok(())
     }
 
+    /// Retrieves all rooms that a user is a member of.
+    ///
+    /// # Arguments
+    /// * `user_id` - The user ID to look up
+    ///
+    /// # Returns
+    /// A list of `Room` objects the user has joined, ordered by name.
     pub async fn get_user_rooms(&self, user_id: u16) -> Result<Vec<Room>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
@@ -428,6 +526,13 @@ impl Database {
         Ok(rooms)
     }
 
+    /// Retrieves the list of user IDs that are members of a room.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room ID to query
+    ///
+    /// # Returns
+    /// A vector of user IDs for all members in the room.
     pub async fn get_room_members(&self, room_id: u16) -> Result<Vec<u16>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT user_id FROM room_memberships WHERE room_id = ?"
@@ -443,6 +548,17 @@ impl Database {
         Ok(members)
     }
 
+    /// Saves a chat message to the database.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room where the message was sent
+    /// * `sender_id` - The user ID of the sender
+    /// * `sender_username` - The username of the sender (denormalized for performance)
+    /// * `content` - The message content
+    /// * `message_type` - Type of message: "user", "system", or "private"
+    ///
+    /// # Returns
+    /// The auto-generated message ID.
     pub async fn save_message(&self, room_id: u16, sender_id: u16, sender_username: &str, content: &str, message_type: &str) -> Result<i64, sqlx::Error> {
         let result = sqlx::query(
             "INSERT INTO messages (room_id, sender_id, sender_username, content, message_type) VALUES (?, ?, ?, ?, ?) RETURNING id"
@@ -458,6 +574,14 @@ impl Database {
         Ok(result.get("id"))
     }
 
+    /// Retrieves message history for a room.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room to fetch messages from
+    /// * `limit` - Maximum number of messages to retrieve
+    ///
+    /// # Returns
+    /// Messages in chronological order (oldest first).
     pub async fn get_room_messages(&self, room_id: u16, limit: i64) -> Result<Vec<StoredMessage>, sqlx::Error> {
         let rows = sqlx::query(
             r#"
@@ -490,10 +614,20 @@ impl Database {
         Ok(messages)
     }
 
+    /// Retrieves the 50 most recent messages from a room.
+    ///
+    /// Convenience wrapper around `get_room_messages` with a default limit.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room to fetch messages from
     pub async fn get_recent_messages(&self, room_id: u16) -> Result<Vec<StoredMessage>, sqlx::Error> {
         self.get_room_messages(room_id, 50).await
     }
 
+    /// Cleans up stale user sessions that have been inactive.
+    ///
+    /// Marks users as offline if they haven't had activity in the last minute.
+    /// Should be called periodically to keep online status accurate.
     pub async fn cleanup_old_sessions(&self) -> Result<(), sqlx::Error> {
         sqlx::query(
             r#"
@@ -521,6 +655,10 @@ impl Database {
         Ok(())
     }
 
+    /// Loads all user accounts from the database into memory.
+    ///
+    /// # Returns
+    /// A HashMap keyed by username containing all registered accounts.
     pub async fn load_all_accounts(&self) -> Result<HashMap<String, Account>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT id, username, password_hash FROM users"
@@ -541,6 +679,10 @@ impl Database {
         Ok(accounts)
     }
 
+    /// Loads all rooms from the database into memory.
+    ///
+    /// # Returns
+    /// A HashMap keyed by room ID containing all rooms.
     pub async fn load_all_rooms(&self) -> Result<HashMap<u16, Room>, sqlx::Error> {
         let rows = sqlx::query(
             "SELECT id, name, description, state, password_hash FROM rooms"
@@ -579,6 +721,10 @@ impl Database {
         Ok(rooms)
     }
 
+    /// Increments the user count for a room by 1.
+    ///
+    /// # Arguments
+    /// * `room_id` - The room to update
     pub async fn increment_room_user_count(&self, room_id: u16) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE rooms SET user_count = user_count + 1 WHERE id = ?")
             .bind(room_id)
@@ -587,6 +733,10 @@ impl Database {
         Ok(())
     }
 
+    /// Decrements the user count for a room by 1 (minimum 0).
+    ///
+    /// # Arguments
+    /// * `room_id` - The room to update
     pub async fn decrement_room_user_count(&self, room_id: u16) -> Result<(), sqlx::Error> {
         sqlx::query("UPDATE rooms SET user_count = user_count - 1 WHERE id = ? AND user_count > 0")
             .bind(room_id)
