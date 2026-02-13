@@ -15,17 +15,29 @@ use std::sync::Arc;
 /// These are verbose and not actionable (e.g., "Cannot open device /dev/dsp")
 #[cfg(target_os = "linux")]
 pub fn suppress_alsa_errors() {
-    // This uses the ALSA C library to set a null error handler
+    // This uses the ALSA C library to set a no-op error handler
+    // Note: passing None/NULL resets to the *default* handler (which prints),
+    // so we must provide an actual empty callback to truly silence messages.
     use std::ffi::c_int;
     
+    unsafe extern "C" fn silent_error_handler(
+        _file: *const i8,
+        _line: c_int,
+        _function: *const i8,
+        _err: c_int,
+        _fmt: *const i8,
+    ) {
+        // Intentionally empty — swallow all ALSA diagnostic messages
+    }
+
     unsafe extern "C" {
         fn snd_lib_error_set_handler(
-            handler: Option<extern "C" fn(*const i8, c_int, *const i8, c_int, *const i8)>,
+            handler: Option<unsafe extern "C" fn(*const i8, c_int, *const i8, c_int, *const i8)>,
         ) -> c_int;
     }
     
     unsafe {
-        snd_lib_error_set_handler(None);
+        snd_lib_error_set_handler(Some(silent_error_handler));
     }
 }
 
@@ -355,11 +367,8 @@ impl AudioManager {
                 stats_input.samples_captured.fetch_add(pushed, Ordering::Relaxed);
             },
             |err| {
-                // Suppress common ALSA underrun messages
-                let msg = err.to_string();
-                if !msg.contains("underrun") {
-                    eprintln!("[Audio] Input stream error: {}", err);
-                }
+                // Silenced: printing here corrupts the TUI alternate screen
+                let _ = err;
             },
             None,
         )?;
@@ -400,11 +409,8 @@ impl AudioManager {
                 stats_output.samples_played.fetch_add(played, Ordering::Relaxed);
             },
             |err| {
-                // Suppress common ALSA underrun messages
-                let msg = err.to_string();
-                if !msg.contains("underrun") {
-                    eprintln!("[Audio] Output stream error: {}", err);
-                }
+                // Silenced: printing here corrupts the TUI alternate screen
+                let _ = err;
             },
             None,
         )?;
@@ -413,9 +419,8 @@ impl AudioManager {
         input_stream.play()?;
         output_stream.play()?;
 
-        println!("[Audio] Input device: {}", input_dev_name);
-        println!("[Audio] Output device: {}", output_dev_name);
-        println!("[Audio] Sample rate: {} Hz, Channels: {}", SAMPLE_RATE, CHANNELS);
+        // Audio device info silenced to avoid corrupting TUI
+        // Input: {input_dev_name}, Output: {output_dev_name}, Rate: {SAMPLE_RATE}Hz
 
         Ok((
             AudioManager {

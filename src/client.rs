@@ -107,7 +107,7 @@ impl ChatClient {
             match line {
                 Ok(json_message) => {
                     if let Ok(message) = Message::from_json_file(&json_message) {
-                        if let MessageType::VoiceCredentials { token, udp_port } =
+                        if let MessageType::VoiceCredentials { token, udp_port, channel_id: _ } =
                             &message.message_type
                         {
                             println!("[Voice] Received credentials. Connecting...");
@@ -334,12 +334,12 @@ impl ChatClient {
             MessageType::AuthFailure { reason } => {
                 println!("[ERROR] {}", reason);
             }
-            MessageType::RoomMessage {
-                room_id,
+            MessageType::ChannelMessage {
+                channel_id,
                 sender_username,
                 content,
             } => {
-                println!("[Room {}] {}: {}", room_id, sender_username, content);
+                println!("[Channel {}] {}: {}", channel_id, sender_username, content);
             }
             MessageType::PrivateMessage {
                 to_user_id: _,
@@ -355,67 +355,67 @@ impl ChatClient {
                     println!("[Server Error]: {}", content);
                 }
             }
-            MessageType::RoomCreated {
-                room_id,
+            MessageType::ServerCreated {
+                server_id,
                 name,
                 description,
             } => {
                 println!(
-                    "[SUCCESS] Room '{}' (ID: {}) created successfully!",
-                    name, room_id
+                    "[SUCCESS] Server '{}' (ID: {}) created successfully!",
+                    name, server_id
                 );
                 println!("         Description: {}", description);
             }
-            MessageType::RoomJoined {
-                room_id,
+            MessageType::ServerJoined {
+                server_id,
                 name,
                 description,
+                channels,
             } => {
                 println!("╔══════════════════════════════════════════════════════════════╗");
-                println!("║ Welcome to '{}' (Room ID: {})!", name, room_id);
-                println!("║");
-                println!("║ About this room:");
-                println!("║    {}", description);
-                println!("║");
-                println!(
-                    "║ You can now send messages with: /msg {} <your message>",
-                    room_id
-                );
+                println!("║ Joined server '{}' (ID: {})", name, server_id);
+                println!("║ {}", description);
+                println!("║ Channels:");
+                for ch in channels {
+                    println!("║   [{}] {} ({})", ch.id, ch.name, ch.channel_type.as_str());
+                }
                 println!("╚══════════════════════════════════════════════════════════════╝");
             }
-            MessageType::RoomNotFound { room_id } => {
-                println!("[INFO] Room {} doesn't exist yet.", room_id);
-                // CHANGED: Instructions update
-                println!("       Would you like to create it? Use:");
-                println!("       /create <name> <description> [password]");
-                println!(
-                    "       Example: /create \"General Chat\" \"A place for general discussion\""
-                );
+            MessageType::ServerLeft { server_id } => {
+                println!("[INFO] Left server {}", server_id);
+            }
+            MessageType::ServerList { servers } => {
+                println!("Available servers:");
+                for s in servers {
+                    println!("  [{}] {} - {} ({} members)", s.id, s.name, s.description, s.member_count);
+                }
+            }
+            MessageType::ChannelCreated { server_id, channel_id, name, channel_type, .. } => {
+                println!("[INFO] Channel '{}' (ID: {}, {}) created in server {}", name, channel_id, channel_type.as_str(), server_id);
+            }
+            MessageType::ChannelJoined { channel_id, name, channel_type, .. } => {
+                println!("[INFO] Joined channel '{}' (ID: {}, {})", name, channel_id, channel_type.as_str());
+            }
+            MessageType::ChannelList { server_id, channels } => {
+                println!("Channels in server {}:", server_id);
+                for ch in channels {
+                    println!("  [{}] {} ({})", ch.id, ch.name, ch.channel_type.as_str());
+                }
+            }
+            MessageType::UserServersSync { servers } => {
+                println!("Your servers:");
+                for swc in servers {
+                    println!("  [{}] {}", swc.server.id, swc.server.name);
+                    for ch in &swc.channels {
+                        println!("    [{}] {} ({})", ch.id, ch.name, ch.channel_type.as_str());
+                    }
+                }
+            }
+            MessageType::VoiceError { message } => {
+                println!("[VOICE ERROR] {}", message);
             }
             MessageType::Register { .. } | MessageType::Login { .. } => {
                 println!("[Debug] Received unexpected auth message");
-            }
-            MessageType::Join { .. }
-            | MessageType::Leave { .. }
-            | MessageType::CreateRoom { .. } => {
-                println!("[Debug] Received unexpected room action message");
-            }
-            MessageType::ListRooms => {
-                println!("[Debug] Received ListRooms request");
-            }
-            MessageType::RoomList { rooms } => {
-                println!("Available rooms:");
-                for room in rooms {
-                    println!("  [{}] {} - {}", room.id, room.name, room.description);
-                }
-            }
-            MessageType::UserStatusUpdate {
-                user_id,
-                username,
-                is_online,
-            } => {
-                let status = if is_online { "online" } else { "offline" };
-                println!("User {} ({}) is now {}", username, user_id, status);
             }
             MessageType::UserListUpdate { users } => {
                 println!("Online users:");
@@ -424,9 +424,8 @@ impl ChatClient {
                     println!("  {} {}", status, user.username);
                 }
             }
-            MessageType::RequestUserList => {
-                println!("[Debug] Received RequestUserList");
-            }
+            MessageType::RequestUserList => {}
+            MessageType::ListServers => {}
             _ => {
                 println!("[Debug] Received other message type");
             }
@@ -500,18 +499,13 @@ impl ChatClient {
                     return None;
                 }
                 if parts.len() < 2 {
-                    println!("Usage: /join <room_id> [password]");
+                    println!("Usage: /join <server_id>");
                     return None;
                 }
-                let room_id: u16 = parts.get(1)?.parse().ok()?;
-                let password = if parts.len() > 2 {
-                    Some(parts[2].to_string())
-                } else {
-                    None
-                };
+                let server_id: u16 = parts.get(1)?.parse().ok()?;
                 Some(Message::new(
                     self.user_id,
-                    MessageType::Join { room_id, password },
+                    MessageType::JoinServer { server_id },
                 ))
             }
             &"/leave" => {
@@ -520,11 +514,11 @@ impl ChatClient {
                     return None;
                 }
                 if parts.len() < 2 {
-                    println!("Usage: /leave <room_id>");
+                    println!("Usage: /leave <server_id>");
                     return None;
                 }
-                let room_id: u16 = parts.get(1)?.parse().ok()?;
-                Some(Message::new(self.user_id, MessageType::Leave { room_id }))
+                let server_id: u16 = parts.get(1)?.parse().ok()?;
+                Some(Message::new(self.user_id, MessageType::LeaveServer { server_id }))
             }
             &"/create" => {
                 if !is_authenticated {
@@ -533,29 +527,21 @@ impl ChatClient {
                 }
 
                 let args = Self::parse_quoted_args(input)?;
-                // CHANGED: Now fewer args required (removed room_id)
                 if args.len() < 3 {
-                    println!("Usage: /create <name> <description> [password]");
+                    println!("Usage: /create <name> <description>");
                     println!(
-                        "Example: /create \"General Chat\" \"A place for general discussion\" [password]"
+                        "Example: /create \"My Server\" \"A cool server\""
                     );
                     return None;
                 }
 
-                // Index 1 is name, 2 is description
                 let name = args.get(1)?.clone();
                 let description = args.get(2)?.clone();
-                let password = if args.len() > 3 {
-                    Some(args.get(3)?.clone())
-                } else {
-                    None
-                };
                 Some(Message::new(
                     self.user_id,
-                    MessageType::CreateRoom {
+                    MessageType::CreateServer {
                         name,
                         description,
-                        password,
                     },
                 ))
             }
@@ -565,15 +551,15 @@ impl ChatClient {
                     return None;
                 }
                 if parts.len() < 3 {
-                    println!("Usage: /msg <room_id> <message>");
+                    println!("Usage: /msg <channel_id> <message>");
                     return None;
                 }
-                let room_id: u16 = parts.get(1)?.parse().ok()?;
+                let channel_id: u16 = parts.get(1)?.parse().ok()?;
                 let content = parts[2..].join(" ");
                 Some(Message::new(
                     self.user_id,
-                    MessageType::RoomMessage {
-                        room_id,
+                    MessageType::ChannelMessage {
+                        channel_id,
                         sender_username: String::new(),
                         content,
                     },
@@ -604,8 +590,13 @@ impl ChatClient {
                     println!("Please login first!");
                     return None;
                 }
-                println!("[Command] Requesting voice connection...");
-                Some(Message::new(self.user_id, MessageType::RequestVoice))
+                if parts.len() < 2 {
+                    println!("Usage: /voice <channel_id>");
+                    return None;
+                }
+                let channel_id: u16 = parts.get(1)?.parse().ok()?;
+                println!("[Command] Requesting voice connection to channel {}...", channel_id);
+                Some(Message::new(self.user_id, MessageType::RequestVoice { channel_id }))
             }
             _ => {
                 println!("Unknown command: {}", input);

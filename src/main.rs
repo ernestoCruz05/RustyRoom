@@ -74,7 +74,7 @@ async fn main() {
             }
         }
         _ => {
-            println!("RustyRoom - TCP Chat Application");
+            println!("Agora - TCP Chat Application");
             println!("Usage: cargo run [server|client|tui] ...");
         }
     }

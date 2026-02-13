@@ -1,9 +1,9 @@
 [package]
-name = "fca"
+name = "agora"
 version = "0.1.0"
 edition = "2024"
 authors = ["Ernesto Cruz <a2023144672@isec.pt>"]
-description = "A multi-threaded TCP chat server with room support"
+description = "A multi-threaded TCP chat server with room support (Agora)"
 license = "MIT"
 repository = "https://github.com/ernestoCruz05/fca"
 keywords = ["tcp", "chat", "server", "networking", "rust"]
